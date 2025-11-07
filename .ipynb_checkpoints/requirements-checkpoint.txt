@@ -1,0 +1,46 @@
+# EfficientIDS-Flax Requirements
+# Compatible with A100 GPUs and TPU v6
+# Pinned versions for fast installation
+
+# ==================== INSTALLATION INSTRUCTIONS ====================
+#
+# For A100 (CUDA 12):
+#   pip install jax[cuda12]==0.4.30 -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+#   pip install -r requirements.txt
+#
+# For TPU v6:
+#   pip install jax[tpu]==0.4.30 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+#   pip install -r requirements.txt
+#
+# Quick install (A100):
+#   pip install jax[cuda12]==0.4.30 flax==0.8.5 optax==0.2.3 orbax-checkpoint==0.5.23
+#
+# ====================================================================
+
+# Core dependencies - strictly pinned for compatibility
+# NOTE: Install JAX separately first (see above for GPU/TPU specific commands)
+# jax[cuda12]==0.4.30  # Install separately - see instructions above
+flax==0.8.5
+optax==0.2.3
+
+# Checkpointing - compatible with JAX 0.4.30
+orbax-checkpoint==0.5.23
+
+# Model loading (for pretrained LMs) - optional, comment out if not needed
+# transformers==4.44.0
+# sentencepiece==0.2.0
+
+# Data processing - optional, comment out if not needed
+numpy==1.26.4
+# tensorflow==2.16.1  # Only needed for data pipeline
+# tensorflow-datasets==4.9.6
+
+# Utilities
+tqdm==4.66.5
+
+# Optional: Distributed training
+# mpi4py>=3.1.0  # For multi-node training
+
+# Optional: Monitoring
+# tensorboard>=2.15.0
+# wandb>=0.16.0
