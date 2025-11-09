@@ -250,6 +250,61 @@ def get_llama_config(
     )
 
 
+def get_gemma_config(
+    num_items: int = 3261,
+    num_clusters: int = 100,
+    max_seq_len: int = 256,
+    batch_size: int = 8,
+    max_steps: int = 10000,
+) -> EfficientIDSConfig:
+    """
+    Configuration for Gemma 2B pretrained model.
+
+    Gemma 2B specs:
+    - hidden_size: 2048
+    - num_layers: 18
+    - num_heads: 8
+    """
+    return EfficientIDSConfig(
+        model=ModelConfig(
+            num_items=num_items,
+            num_clusters=num_clusters,
+            item_embedding_dim=384,
+            model_dims=2048,  # Gemma 2B hidden size
+            use_hierarchical_softmax=True,
+            pretrained_lm_name="gemma-2b",
+            freeze_lm=True,
+        ),
+        training=TrainingConfig(
+            max_steps=max_steps,
+            warmup_steps=1000,
+            batch_size=batch_size,
+            max_seq_len=max_seq_len,
+            learning_rate=5e-5,  # Lower LR for pretrained
+            schedule_type='cosine',
+            optimizer_type='adamw',
+            weight_decay=0.01,
+            clip_grad_norm=1.0,
+            log_every=50,
+            eval_every=500,
+            save_every=1000,
+        ),
+        data=DataConfig(
+            data_dir="./data/ml1m_processed/processed",
+            mode='id_only',
+            embedding_init_method='metadata',
+        ),
+        eval=EvalConfig(
+            k_values=[1, 5, 10],
+            metric_types=['recall', 'mrr', 'ndcg', 'accuracy'],
+            num_eval_batches=100,
+        ),
+        checkpoint_dir="./checkpoints/gemma",
+        log_dir="./logs/gemma",
+        experiment_name="gemma_2b",
+    )
+
+
 def get_debug_config() -> EfficientIDSConfig:
     """
     Minimal configuration for debugging and testing.

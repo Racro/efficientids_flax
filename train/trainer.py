@@ -75,6 +75,7 @@ class Trainer:
         self,
         rng: jax.Array,
         sample_input: Dict[str, jnp.ndarray],
+        pretrained_params: Optional[Dict[str, Any]] = None,
     ) -> TrainState:
         """
         Initialize training state.
@@ -82,6 +83,7 @@ class Trainer:
         Args:
             rng: Random key
             sample_input: Sample input batch for initialization
+            pretrained_params: Optional pretrained parameters to load
 
         Returns:
             TrainState with initialized parameters and optimizer state
@@ -89,6 +91,10 @@ class Trainer:
         # Initialize model parameters
         variables = self.model.init(rng, **sample_input, training=True)
         params = variables['params']
+
+        # Load pretrained params if provided
+        if pretrained_params is not None:
+            params = self._merge_pretrained_params(params, pretrained_params)
 
         # Create train state
         state = TrainState.create(
@@ -98,6 +104,33 @@ class Trainer:
         )
 
         return state
+
+    def _merge_pretrained_params(
+        self,
+        initialized_params: Dict[str, Any],
+        pretrained_params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Merge pretrained parameters into initialized parameters.
+
+        Only merges transformer weights, leaving item embeddings and adapters
+        as randomly initialized.
+
+        Args:
+            initialized_params: Randomly initialized parameters
+            pretrained_params: Pretrained Gemma parameters
+
+        Returns:
+            Merged parameters
+        """
+        import copy
+        merged = copy.deepcopy(initialized_params)
+
+        # Merge transformer parameters if present
+        if 'transformer' in pretrained_params and 'transformer' in merged:
+            merged['transformer'] = pretrained_params['transformer']
+
+        return merged
 
     @staticmethod
     def train_step(
@@ -182,8 +215,20 @@ class Trainer:
         targets = batch.get('targets')
         weights = batch.get('weights', jnp.ones_like(targets))
 
+        # Compute cross-entropy loss from logits
+        if targets is not None and logits is not None:
+            log_probs = jax.nn.log_softmax(logits, axis=-1)
+            target_log_probs = jnp.take_along_axis(
+                log_probs,
+                jnp.expand_dims(targets, axis=-1),
+                axis=-1
+            ).squeeze(axis=-1)
+            loss = -jnp.sum(target_log_probs * weights) / (jnp.sum(weights) + 1e-8)
+        else:
+            loss = 0.0
+
         metrics = {
-            'eval_loss': outputs.get('total_loss', outputs.get('loss', 0.0)),
+            'eval_loss': loss,
         }
 
         if targets is not None:

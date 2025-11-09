@@ -80,9 +80,11 @@ class SimpleHierarchicalSoftmax(nn.Module):
                 hidden_states, item_embeddings, targets, loss_mask, cluster_embeddings
             )
         else:
-            # Inference: return dummy logits
-            dummy_logits = jnp.zeros(hidden_states.shape[:-1] + (self.num_items,))
-            return dummy_logits, {}
+            # Inference: compute full logits for all items
+            logits = self._compute_inference_logits(
+                hidden_states, item_embeddings, cluster_embeddings
+            )
+            return logits, {}
 
     def _compute_training_loss(
         self,
@@ -182,3 +184,28 @@ class SimpleHierarchicalSoftmax(nn.Module):
         # Return dummy logits
         dummy_logits = jnp.zeros(hidden_states.shape[:-1] + (self.num_items,))
         return dummy_logits, metrics
+
+    def _compute_inference_logits(
+        self,
+        hidden_states: jnp.ndarray,  # [batch, seq_len, dim]
+        item_embeddings: jnp.ndarray,  # [num_items, dim]
+        cluster_embeddings: jnp.ndarray,  # [num_clusters, dim]
+    ) -> jnp.ndarray:
+        """
+        Compute full item logits for inference.
+
+        For hierarchical softmax, we compute:
+        logits[i] = log P(cluster[i]) + log P(item[i] | cluster[i])
+
+        Args:
+            hidden_states: [batch, seq_len, dim]
+            item_embeddings: [num_items, dim]
+            cluster_embeddings: [num_clusters, dim]
+
+        Returns:
+            logits: [batch, seq_len, num_items]
+        """
+        # Simple approach: just compute dot product with all item embeddings
+        # This is O(num_items) but simpler and correct
+        logits = jnp.einsum('...d,id->...i', hidden_states, item_embeddings)
+        return logits

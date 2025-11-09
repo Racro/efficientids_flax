@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from configs.config import (
     get_qwen_config,
     get_llama_config,
+    get_gemma_config,
     get_debug_config,
     EfficientIDSConfig,
 )
@@ -38,6 +39,10 @@ from data.dataset import create_dataloaders, ClusteringInfo
 from core.models import SimpleEfficientIDSModel
 from train.trainer import Trainer
 from train.optimizer import create_optimizer, create_learning_rate_schedule
+
+# Gemma imports - we'll load weights manually without gemma package
+import orbax.checkpoint as ocp
+GEMMA_AVAILABLE = True  # We can always use Gemma with Orbax
 
 logging.basicConfig(
     level=logging.INFO,
@@ -115,6 +120,58 @@ def create_optimizer_from_config(config: EfficientIDSConfig):
     return optimizer
 
 
+def create_gemma_model(config: EfficientIDSConfig, clustering_info: ClusteringInfo, pretrained_path: str, freeze_gemma: bool):
+    """
+    Create Gemma-style EfficientIDS model with pretrained weights.
+
+    Args:
+        config: Configuration
+        clustering_info: Clustering information
+        pretrained_path: Path to Gemma checkpoint (e.g., '../2b/')
+        freeze_gemma: Freeze Gemma weights
+
+    Returns:
+        model: GemmaEfficientIDSModel
+        gemma_params: Pretrained Gemma parameters
+    """
+    from core.gemma_model import GemmaEfficientIDSModel, load_gemma_params, reshape_gemma_params_for_flax
+
+    logger.info("Creating Gemma model with pretrained weights...")
+    logger.info(f"  Loading checkpoint from: {pretrained_path}")
+
+    # Load Gemma checkpoint
+    try:
+        gemma_params = load_gemma_params(pretrained_path)
+        logger.info(f"  ✓ Loaded Gemma checkpoint")
+
+        # Reshape params for Flax
+        gemma_params_flax = reshape_gemma_params_for_flax(gemma_params)
+        logger.info(f"  ✓ Reshaped params for Flax")
+    except Exception as e:
+        logger.warning(f"  Failed to load checkpoint: {e}")
+        logger.warning(f"  Will initialize from scratch")
+        gemma_params_flax = None
+
+    # Create model with Gemma dimensions
+    model = GemmaEfficientIDSModel(
+        num_items=config.model.num_items,
+        num_clusters=config.model.num_clusters,
+        item_embedding_dim=config.model.item_embedding_dim,
+        model_dims=2048,  # Gemma 2B hidden size
+        clustering_info=clustering_info,
+        freeze_gemma=freeze_gemma,
+    )
+
+    logger.info("Model created:")
+    logger.info(f"  Items: {config.model.num_items}")
+    logger.info(f"  Clusters: {config.model.num_clusters}")
+    logger.info(f"  Item embedding dim: {config.model.item_embedding_dim}")
+    logger.info(f"  Model dims: 2048 (Gemma 2B)")
+    logger.info(f"  Freeze Gemma: {freeze_gemma}")
+
+    return model, gemma_params_flax
+
+
 def main(args):
     """Main training function."""
 
@@ -134,6 +191,14 @@ def main(args):
         )
     elif args.config == 'llama':
         config = get_llama_config(
+            num_items=args.num_items,
+            num_clusters=args.num_clusters,
+            max_seq_len=args.max_seq_len,
+            batch_size=args.batch_size,
+            max_steps=args.max_steps,
+        )
+    elif args.config == 'gemma':
+        config = get_gemma_config(
             num_items=args.num_items,
             num_clusters=args.num_clusters,
             max_seq_len=args.max_seq_len,
@@ -186,7 +251,14 @@ def main(args):
     logger.info("Creating model...")
     logger.info("=" * 80)
 
-    model = create_model_from_config(config, clustering_info)
+    # Check if using pretrained model
+    gemma_params = None
+    if args.use_pretrained == 'gemma':
+        model, gemma_params = create_gemma_model(
+            config, clustering_info, args.pretrained_path, args.freeze_pretrained
+        )
+    else:
+        model = create_model_from_config(config, clustering_info)
 
     # ==================== 4. CREATE OPTIMIZER ====================
     logger.info("\n" + "=" * 80)
@@ -222,12 +294,16 @@ def main(args):
     # Get sample batch for initialization
     sample_batch = next(iter(train_dataset))
 
-    # Initialize state
-    state = trainer.create_train_state(rng, sample_batch)
+    # Initialize state (with optional pretrained params)
+    state = trainer.create_train_state(rng, sample_batch, pretrained_params=gemma_params)
 
     # Count parameters
     num_params = sum(x.size for x in jax.tree_util.tree_leaves(state.params))
     logger.info(f"Model initialized with {num_params:,} parameters")
+
+    # If using pretrained weights, log it
+    if gemma_params is not None:
+        logger.info(f"✓ Loaded pretrained Gemma weights from {args.pretrained_path}")
 
     # ==================== 7. TRAIN ====================
     logger.info("\n" + "=" * 80)
@@ -303,8 +379,28 @@ if __name__ == "__main__":
         '--config',
         type=str,
         default='qwen',
-        choices=['qwen', 'llama', 'debug'],
+        choices=['qwen', 'llama', 'debug', 'gemma'],
         help='Preset configuration to use'
+    )
+
+    # Pretrained model
+    parser.add_argument(
+        '--use_pretrained',
+        type=str,
+        default=None,
+        choices=[None, 'gemma'],
+        help='Use pretrained model (None for simple model, "gemma" for Gemma 2B)'
+    )
+    parser.add_argument(
+        '--pretrained_path',
+        type=str,
+        default='./2b',
+        help='Path to pretrained model checkpoint'
+    )
+    parser.add_argument(
+        '--freeze_pretrained',
+        action='store_true',
+        help='Freeze pretrained model weights (only train adapters + item embeddings)'
     )
 
     # Data args
