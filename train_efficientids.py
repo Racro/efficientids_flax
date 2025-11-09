@@ -36,7 +36,6 @@ from configs.config import (
 )
 from data.dataset import create_dataloaders, ClusteringInfo
 from core.models import SimpleEfficientIDSModel
-from core.hierarchical import HierarchicalSoftmax
 from train.trainer import Trainer
 from train.optimizer import create_optimizer, create_learning_rate_schedule
 

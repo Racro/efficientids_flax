@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from data.dataset import MovieLensDataset
-from core.hierarchical_simple import SimpleHierarchicalSoftmax
+from core.hierarchical_simple import SimpleHierarchicalSoftmax, JaxClusteringInfo
 
 print("=" * 80)
 print("Hierarchical Softmax Debug")
@@ -24,12 +24,16 @@ dataset = MovieLensDataset(
 
 clustering_info = dataset.get_clustering_info()
 
+# Convert to JAX arrays for compatibility with Flax 0.8+
+jax_clustering = JaxClusteringInfo.from_numpy_clustering_info(clustering_info)
+
 # Create hierarchical softmax
 hs = SimpleHierarchicalSoftmax(
     num_items=dataset.num_items,
     num_clusters=dataset.num_clusters,
     item_embedding_dim=64,
-    clustering_info=clustering_info,
+    cluster_assignments=jax_clustering.cluster_assignments,
+    cluster_indices=jax_clustering.cluster_indices,
 )
 
 # Create synthetic inputs
@@ -81,7 +85,7 @@ print(f"      Max: {jnp.max(cluster_logits):.4f}")
 print(f"      NaN: {jnp.isnan(cluster_logits).any()}")
 
 print(f"\n   Step 3: Target cluster IDs")
-target_cluster_ids = jnp.take(clustering_info.cluster_assignments, targets)
+target_cluster_ids = jnp.take(jax_clustering.cluster_assignments, targets)
 print(f"      Shape: {target_cluster_ids.shape}")
 print(f"      Sample: {target_cluster_ids[0, :5]}")
 print(f"      Min: {jnp.min(target_cluster_ids)}")
@@ -98,7 +102,7 @@ print(f"      NaN: {jnp.isnan(cluster_log_probs).any()}")
 print(f"      Inf: {jnp.isinf(cluster_log_probs).any()}")
 
 print(f"\n   Step 5: Cluster members")
-cluster_members = jnp.take(clustering_info.cluster_indices, target_cluster_ids, axis=0)
+cluster_members = jnp.take(jax_clustering.cluster_indices, target_cluster_ids, axis=0)
 print(f"      Shape: {cluster_members.shape}")
 print(f"      Sample [0,0,:10]: {cluster_members[0, 0, :10]}")
 print(f"      Has -1 padding: {(cluster_members == -1).any()}")

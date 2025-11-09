@@ -256,8 +256,8 @@ def get_debug_config() -> EfficientIDSConfig:
     """
     return EfficientIDSConfig(
         model=ModelConfig(
-            num_items=100,
-            num_clusters=10,
+            num_items=3261,  # Use real num_items to match data
+            num_clusters=100,  # Use real num_clusters to match data
             item_embedding_dim=64,
             model_dims=128,
         ),
@@ -269,7 +269,7 @@ def get_debug_config() -> EfficientIDSConfig:
             learning_rate=1e-3,
             log_every=20,
             eval_every=50,
-            save_every=100,
+            save_every=999999,  # Disable checkpointing for debugging
         ),
         data=DataConfig(
             data_dir="./data/ml1m_processed/processed",

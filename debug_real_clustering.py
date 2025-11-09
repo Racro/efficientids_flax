@@ -47,18 +47,15 @@ print(f'   Sample [0]: {target_cluster_ids[0]}')
 print(f'   Min: {target_cluster_ids.min()}')
 print(f'   Max: {target_cluster_ids.max()}')
 
-# Try take_along_axis
-print(f'\n4. Using jnp.take_along_axis:')
+# Try simple indexing (correct approach for JAX)
+print(f'\n4. Using simple indexing:')
 print(f'   cluster_indices shape: {clustering.cluster_indices.shape}')
 print(f'   target_cluster_ids shape: {target_cluster_ids.shape}')
-expanded = jnp.expand_dims(target_cluster_ids, axis=-1)
-print(f'   expanded shape: {expanded.shape}')
 
-cluster_members = jnp.take_along_axis(
-    clustering.cluster_indices,
-    expanded,
-    axis=0
-)
+# Convert to JAX array and use simple indexing
+cluster_indices_jax = jnp.array(clustering.cluster_indices)
+cluster_members = cluster_indices_jax[target_cluster_ids]  # [2, 5, 195]
+
 print(f'   Result shape: {cluster_members.shape}')
 print(f'   Has -1: {(cluster_members == -1).any()}')
 print(f'   Sample [0,0,:10]: {cluster_members[0, 0, :10]}')

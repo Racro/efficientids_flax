@@ -20,7 +20,7 @@ import numpy as np
 try:
     # Try relative imports first (when used as package)
     from .embeddings import ItemEmbedding, ItemInputAdapter, ItemOutputAdapter, create_embedding_initializer
-    from .hierarchical_simple import SimpleHierarchicalSoftmax
+    from .hierarchical_simple import SimpleHierarchicalSoftmax, JaxClusteringInfo
     from .llama_flax import LlamaModel
 except ImportError:
     # Fall back to absolute imports (when run as script)
@@ -28,7 +28,7 @@ except ImportError:
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent))
     from embeddings import ItemEmbedding, ItemInputAdapter, ItemOutputAdapter, create_embedding_initializer
-    from hierarchical_simple import SimpleHierarchicalSoftmax
+    from hierarchical_simple import SimpleHierarchicalSoftmax, JaxClusteringInfo
     from llama_flax import LlamaModel
 
 # ClusteringInfo comes from data.dataset
@@ -103,11 +103,14 @@ class EfficientIDSModel(nn.Module):
 
         # ==================== HIERARCHICAL SOFTMAX ====================
         if self.clustering_info is not None:
+            # Convert clustering_info to JAX arrays for Flax 0.8+ compatibility
+            jax_clustering = JaxClusteringInfo.from_numpy_clustering_info(self.clustering_info)
             self.hierarchical_softmax = SimpleHierarchicalSoftmax(
                 num_items=self.num_items,
                 num_clusters=self.num_clusters,
                 item_embedding_dim=self.item_embedding_dim,
-                clustering_info=self.clustering_info,
+                cluster_assignments=jax_clustering.cluster_assignments,
+                cluster_indices=jax_clustering.cluster_indices,
             )
 
     def __call__(
@@ -274,27 +277,7 @@ class SimpleEfficientIDSModel(nn.Module):
     clustering_info: Optional[Any] = None  # ClusteringInfo from data.dataset
     use_correction: bool = True
 
-    def setup(self):
-        """Initialize components."""
-        # Create shared item embedding table
-        self.item_embedding_table = self.param(
-            'item_embedding_table',
-            nn.initializers.xavier_uniform(),
-            (self.num_items, self.item_embedding_dim)
-        )
-
-        # Simple projection layer (instead of full transformer)
-        self.projection = nn.Dense(features=self.item_embedding_dim, name='projection')
-
-        # Hierarchical softmax
-        if self.clustering_info is not None:
-            self.hierarchical_softmax = SimpleHierarchicalSoftmax(
-                num_items=self.num_items,
-                num_clusters=self.num_clusters,
-                item_embedding_dim=self.item_embedding_dim,
-                clustering_info=self.clustering_info,
-            )
-
+    @nn.compact
     def __call__(
         self,
         item_ids: jnp.ndarray,
@@ -317,27 +300,44 @@ class SimpleEfficientIDSModel(nn.Module):
         Returns:
             Dictionary with logits, loss, metrics
         """
+        # Initialize item embedding table
+        item_embedding_table = self.param(
+            'item_embedding_table',
+            nn.initializers.xavier_uniform(),
+            (self.num_items, self.item_embedding_dim)
+        )
+
         # Use weights as item_mask if item_mask not provided
         if item_mask is None and weights is not None:
             item_mask = weights
+
         # Embed items using the shared embedding table
-        item_embs = self.item_embedding_table[item_ids]  # [batch, seq_len, item_emb_dim]
+        item_embs = item_embedding_table[item_ids]  # [batch, seq_len, item_emb_dim]
 
         # Simple projection (placeholder for transformer)
-        hidden = self.projection(item_embs)  # [batch, seq_len, item_emb_dim]
+        hidden = nn.Dense(features=self.item_embedding_dim, name='projection')(item_embs)
 
         # Predict with hierarchical softmax using the same embedding table
         if self.clustering_info is not None:
-            logits, metrics = self.hierarchical_softmax(
+            # Convert clustering_info to JAX arrays for Flax 0.10 compatibility
+            jax_clustering = JaxClusteringInfo.from_numpy_clustering_info(self.clustering_info)
+            hierarchical_softmax = SimpleHierarchicalSoftmax(
+                num_items=self.num_items,
+                num_clusters=self.num_clusters,
+                item_embedding_dim=self.item_embedding_dim,
+                cluster_assignments=jax_clustering.cluster_assignments,
+                cluster_indices=jax_clustering.cluster_indices,
+            )
+            logits, metrics = hierarchical_softmax(
                 hidden_states=hidden,
-                item_embeddings=self.item_embedding_table,
+                item_embeddings=item_embedding_table,
                 targets=targets,
                 loss_mask=item_mask,  # Use loss_mask parameter name
                 training=training,
             )
         else:
             # Full softmax
-            logits = jnp.einsum('bsd,id->bsi', hidden, self.item_embedding_table)
+            logits = jnp.einsum('bsd,id->bsi', hidden, item_embedding_table)
             metrics = {}
 
         return {
@@ -435,11 +435,14 @@ class LlamaEfficientIDSModel(nn.Module):
 
         # ==================== HIERARCHICAL SOFTMAX ====================
         if self.clustering_info is not None:
+            # Convert clustering_info to JAX arrays for Flax 0.8+ compatibility
+            jax_clustering = JaxClusteringInfo.from_numpy_clustering_info(self.clustering_info)
             self.hierarchical_softmax = SimpleHierarchicalSoftmax(
                 num_items=self.num_items,
                 num_clusters=self.num_clusters,
                 item_embedding_dim=self.item_embedding_dim,
-                clustering_info=self.clustering_info,
+                cluster_assignments=jax_clustering.cluster_assignments,
+                cluster_indices=jax_clustering.cluster_indices,
             )
 
     def __call__(

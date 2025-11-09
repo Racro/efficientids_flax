@@ -10,9 +10,26 @@ import jax.numpy as jnp
 import numpy as np
 import flax.linen as nn
 from typing import Optional, Tuple, Dict, Any
+from dataclasses import dataclass
 
-# ClusteringInfo will be passed in from dataset.py
-# It's a dataclass with np.ndarray fields
+
+@dataclass
+class JaxClusteringInfo:
+    """JAX-compatible clustering info (all arrays converted to jnp.ndarray)."""
+    cluster_assignments: jnp.ndarray
+    cluster_indices: jnp.ndarray
+    in_cluster_id: jnp.ndarray
+    cluster_centers: Optional[jnp.ndarray] = None
+
+    @staticmethod
+    def from_numpy_clustering_info(info):
+        """Convert numpy ClusteringInfo to JAX arrays."""
+        return JaxClusteringInfo(
+            cluster_assignments=jnp.array(info.cluster_assignments),
+            cluster_indices=jnp.array(info.cluster_indices),
+            in_cluster_id=jnp.array(info.in_cluster_id),
+            cluster_centers=jnp.array(info.cluster_centers) if info.cluster_centers is not None else None,
+        )
 
 
 class SimpleHierarchicalSoftmax(nn.Module):
@@ -25,17 +42,11 @@ class SimpleHierarchicalSoftmax(nn.Module):
     num_items: int
     num_clusters: int
     item_embedding_dim: int
-    clustering_info: Any  # ClusteringInfo from data.dataset
+    # Store clustering arrays directly as static pytree nodes
+    cluster_assignments: jnp.ndarray
+    cluster_indices: jnp.ndarray
 
-    def setup(self):
-        """Initialize cluster embeddings."""
-        # Create learnable cluster embeddings
-        self.cluster_embeddings = self.param(
-            'cluster_embeddings',
-            nn.initializers.xavier_uniform(),
-            (self.num_clusters, self.item_embedding_dim)
-        )
-
+    @nn.compact
     def __call__(
         self,
         hidden_states: jnp.ndarray,  # [batch, seq_len, item_embedding_dim]
@@ -57,9 +68,16 @@ class SimpleHierarchicalSoftmax(nn.Module):
         Returns:
             (logits, metrics) tuple
         """
+        # Initialize cluster embeddings (moved from setup() to fix Flax 0.8+ compatibility)
+        cluster_embeddings = self.param(
+            'cluster_embeddings',
+            nn.initializers.xavier_uniform(),
+            (self.num_clusters, self.item_embedding_dim)
+        )
+
         if training and targets is not None:
             return self._compute_training_loss(
-                hidden_states, item_embeddings, targets, loss_mask
+                hidden_states, item_embeddings, targets, loss_mask, cluster_embeddings
             )
         else:
             # Inference: return dummy logits
@@ -72,6 +90,7 @@ class SimpleHierarchicalSoftmax(nn.Module):
         item_embeddings: jnp.ndarray,
         targets: jnp.ndarray,
         loss_mask: Optional[jnp.ndarray],
+        cluster_embeddings: jnp.ndarray,
     ) -> Tuple[jnp.ndarray, Dict]:
         """Compute hierarchical softmax loss."""
 
@@ -79,10 +98,10 @@ class SimpleHierarchicalSoftmax(nn.Module):
             loss_mask = jnp.ones(targets.shape, dtype=jnp.float32)
 
         # Step 1: Compute cluster logits
-        cluster_logits = jnp.einsum('...d,cd->...c', hidden_states, self.cluster_embeddings)
+        cluster_logits = jnp.einsum('...d,cd->...c', hidden_states, cluster_embeddings)
 
         # Step 2: Get target cluster IDs
-        target_cluster_ids = jnp.take(self.clustering_info.cluster_assignments, targets)
+        target_cluster_ids = jnp.take(self.cluster_assignments, targets)
 
         # Step 3: Cluster loss
         cluster_log_probs = jax.nn.log_softmax(cluster_logits)
@@ -93,23 +112,9 @@ class SimpleHierarchicalSoftmax(nn.Module):
         ).squeeze(axis=-1)
 
         # Step 4: Item-within-cluster loss
-        # Get cluster members for target clusters (matching PAXml approach - flatten first!)
-        # PAXml lines 1413-1430: flatten, take_along_axis, reshape
-        batch_shape = target_cluster_ids.shape  # e.g., [batch, seq_len]
-
-        # Flatten target_cluster_ids
-        flat_cluster_ids = jnp.reshape(target_cluster_ids, [-1])  # [batch * seq_len]
-
-        # Get cluster members for each flattened position
-        cluster_members_flat = jnp.take_along_axis(
-            self.clustering_info.cluster_indices,
-            jnp.expand_dims(flat_cluster_ids, axis=-1),  # [batch*seq_len, 1]
-            axis=0
-        )  # [batch*seq_len, max_cluster_size]
-
-        # Reshape back to [batch, seq_len, max_cluster_size]
-        max_cluster_size = self.clustering_info.cluster_indices.shape[1]
-        cluster_members = jnp.reshape(cluster_members_flat, (*batch_shape, max_cluster_size))
+        # Get cluster members for target clusters using simple indexing
+        # JAX supports advanced indexing: cluster_indices[target_cluster_ids] directly
+        cluster_members = self.cluster_indices[target_cluster_ids]  # [batch, seq_len, max_cluster_size]
 
         # Mask for valid cluster members
         valid_mask = cluster_members != -1
