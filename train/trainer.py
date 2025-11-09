@@ -158,6 +158,7 @@ class Trainer:
     def eval_step(
         state: TrainState,
         batch: Dict[str, jnp.ndarray],
+        compute_full_metrics: bool = False,
     ) -> Dict[str, jnp.ndarray]:
         """
         Single evaluation step.
@@ -165,6 +166,7 @@ class Trainer:
         Args:
             state: Current train state
             batch: Input batch
+            compute_full_metrics: If True, compute all metrics (recall, MRR, NDCG, etc.)
 
         Returns:
             Metrics dict
@@ -178,17 +180,33 @@ class Trainer:
         # Extract predictions for accuracy computation
         logits = outputs['logits']
         targets = batch.get('targets')
-
-        if targets is not None:
-            predictions = jnp.argmax(logits, axis=-1)
-            accuracy = jnp.mean((predictions == targets).astype(jnp.float32))
-        else:
-            accuracy = 0.0
+        weights = batch.get('weights', jnp.ones_like(targets))
 
         metrics = {
-            'eval_accuracy': accuracy,
             'eval_loss': outputs.get('total_loss', outputs.get('loss', 0.0)),
         }
+
+        if targets is not None:
+            # Simple accuracy
+            predictions = jnp.argmax(logits, axis=-1)
+            accuracy = jnp.mean((predictions == targets).astype(jnp.float32) * weights) / jnp.maximum(jnp.mean(weights), 1e-8)
+            metrics['eval_accuracy'] = accuracy
+
+            # Full metrics (if requested)
+            if compute_full_metrics:
+                try:
+                    from ..core.metrics import compute_metrics_from_logits
+                    full_metrics = compute_metrics_from_logits(
+                        logits=logits,
+                        labels=targets,
+                        weights=weights,
+                        k_values=[1, 5, 10],
+                        metric_types=['recall', 'mrr', 'accuracy'],
+                    )
+                    # Prefix with 'eval_'
+                    metrics.update({f'eval_{k}': v for k, v in full_metrics.items()})
+                except ImportError:
+                    pass  # Metrics module not available
 
         return metrics
 

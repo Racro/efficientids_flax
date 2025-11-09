@@ -42,9 +42,12 @@ LLAMA_CONFIGS = {
         'model_name': 'meta-llama/Llama-3.2-1B',
         'hidden_size': 2048,
         'intermediate_size': 8192,
-        'num_hidden_layers': 16,
-        'num_attention_heads': 32,
-        'num_key_value_heads': 8,
+        'num_hidden_layers': 16,  # HF name
+        'num_layers': 16,  # Flax name
+        'num_attention_heads': 32,  # HF name
+        'num_heads': 32,  # Flax name
+        'num_key_value_heads': 8,  # HF name
+        'num_kv_heads': 8,  # Flax name
         'vocab_size': 128256,
         'max_position_embeddings': 131072,
     },
@@ -53,8 +56,11 @@ LLAMA_CONFIGS = {
         'hidden_size': 3072,
         'intermediate_size': 8192,
         'num_hidden_layers': 28,
+        'num_layers': 28,
         'num_attention_heads': 24,
+        'num_heads': 24,
         'num_key_value_heads': 8,
+        'num_kv_heads': 8,
         'vocab_size': 128256,
         'max_position_embeddings': 131072,
     },
@@ -63,8 +69,11 @@ LLAMA_CONFIGS = {
         'hidden_size': 4096,
         'intermediate_size': 14336,
         'num_hidden_layers': 32,
+        'num_layers': 32,
         'num_attention_heads': 32,
+        'num_heads': 32,
         'num_key_value_heads': 8,
+        'num_kv_heads': 8,
         'vocab_size': 128256,
         'max_position_embeddings': 8192,
     },

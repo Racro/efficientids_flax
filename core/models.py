@@ -20,7 +20,7 @@ import numpy as np
 try:
     # Try relative imports first (when used as package)
     from .embeddings import ItemEmbedding, ItemInputAdapter, ItemOutputAdapter, create_embedding_initializer
-    from .hierarchical import HierarchicalSoftmax, ClusteringInfo
+    from .hierarchical_simple import SimpleHierarchicalSoftmax
     from .llama_flax import LlamaModel
 except ImportError:
     # Fall back to absolute imports (when run as script)
@@ -28,8 +28,11 @@ except ImportError:
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent))
     from embeddings import ItemEmbedding, ItemInputAdapter, ItemOutputAdapter, create_embedding_initializer
-    from hierarchical import HierarchicalSoftmax, ClusteringInfo
+    from hierarchical_simple import SimpleHierarchicalSoftmax
     from llama_flax import LlamaModel
+
+# ClusteringInfo comes from data.dataset
+from typing import Any
 
 
 class EfficientIDSModel(nn.Module):
@@ -53,7 +56,7 @@ class EfficientIDSModel(nn.Module):
     num_items: int
     num_clusters: int
     item_embedding_dim: int = 384
-    clustering_info: Optional[ClusteringInfo] = None
+    clustering_info: Optional[Any] = None  # ClusteringInfo from data.dataset
     freeze_lm: bool = True
     item_embedding_init: Optional[np.ndarray] = None
     use_correction: bool = True
@@ -100,13 +103,11 @@ class EfficientIDSModel(nn.Module):
 
         # ==================== HIERARCHICAL SOFTMAX ====================
         if self.clustering_info is not None:
-            self.hierarchical_softmax = HierarchicalSoftmax(
+            self.hierarchical_softmax = SimpleHierarchicalSoftmax(
                 num_items=self.num_items,
                 num_clusters=self.num_clusters,
                 item_embedding_dim=self.item_embedding_dim,
                 clustering_info=self.clustering_info,
-                use_correction=self.use_correction,
-                name='hierarchical_softmax'
             )
 
     def __call__(
@@ -270,7 +271,7 @@ class SimpleEfficientIDSModel(nn.Module):
     num_clusters: int
     item_embedding_dim: int = 384
     model_dims: int = 512
-    clustering_info: Optional[ClusteringInfo] = None
+    clustering_info: Optional[Any] = None  # ClusteringInfo from data.dataset
     use_correction: bool = True
 
     def setup(self):
@@ -287,20 +288,21 @@ class SimpleEfficientIDSModel(nn.Module):
 
         # Hierarchical softmax
         if self.clustering_info is not None:
-            self.hierarchical_softmax = HierarchicalSoftmax(
+            self.hierarchical_softmax = SimpleHierarchicalSoftmax(
                 num_items=self.num_items,
                 num_clusters=self.num_clusters,
                 item_embedding_dim=self.item_embedding_dim,
                 clustering_info=self.clustering_info,
-                use_correction=self.use_correction,
             )
 
     def __call__(
         self,
         item_ids: jnp.ndarray,
         targets: Optional[jnp.ndarray] = None,
+        weights: Optional[jnp.ndarray] = None,
         item_mask: Optional[jnp.ndarray] = None,
         training: bool = True,
+        **kwargs,  # Accept extra args from batch
     ) -> Dict[str, jnp.ndarray]:
         """
         Simple forward pass: embed items → project → predict next item.
@@ -308,12 +310,16 @@ class SimpleEfficientIDSModel(nn.Module):
         Args:
             item_ids: [batch, seq_len] item ID sequence
             targets: [batch, seq_len] target items (training)
+            weights: [batch, seq_len] mask for valid positions (alias for item_mask)
             item_mask: [batch, seq_len] mask for valid positions
             training: Training mode
 
         Returns:
             Dictionary with logits, loss, metrics
         """
+        # Use weights as item_mask if item_mask not provided
+        if item_mask is None and weights is not None:
+            item_mask = weights
         # Embed items using the shared embedding table
         item_embs = self.item_embedding_table[item_ids]  # [batch, seq_len, item_emb_dim]
 
@@ -326,7 +332,7 @@ class SimpleEfficientIDSModel(nn.Module):
                 hidden_states=hidden,
                 item_embeddings=self.item_embedding_table,
                 targets=targets,
-                item_mask=item_mask,
+                loss_mask=item_mask,  # Use loss_mask parameter name
                 training=training,
             )
         else:
@@ -381,7 +387,7 @@ class LlamaEfficientIDSModel(nn.Module):
     max_seq_len: int = 256
 
     # Optional configs
-    clustering_info: Optional[ClusteringInfo] = None
+    clustering_info: Optional[Any] = None  # ClusteringInfo from data.dataset
     freeze_llama: bool = True
     use_correction: bool = True
 
@@ -429,32 +435,33 @@ class LlamaEfficientIDSModel(nn.Module):
 
         # ==================== HIERARCHICAL SOFTMAX ====================
         if self.clustering_info is not None:
-            self.hierarchical_softmax = HierarchicalSoftmax(
+            self.hierarchical_softmax = SimpleHierarchicalSoftmax(
                 num_items=self.num_items,
                 num_clusters=self.num_clusters,
                 item_embedding_dim=self.item_embedding_dim,
                 clustering_info=self.clustering_info,
-                use_correction=self.use_correction,
             )
 
     def __call__(
         self,
-        input_ids: Optional[jnp.ndarray] = None,  # Text token IDs
-        item_ids: Optional[jnp.ndarray] = None,  # Item IDs
-        item_mask: Optional[jnp.ndarray] = None,  # Mask: 1 = item, 0 = text
+        input_ids: Optional[jnp.ndarray] = None,  # Text token IDs or item IDs for interleaved
+        item_weights: Optional[jnp.ndarray] = None,  # 0 = text token, 1 = item token
         attention_mask: Optional[jnp.ndarray] = None,
         targets: Optional[jnp.ndarray] = None,  # Target items
+        loss_mask: Optional[jnp.ndarray] = None,  # Where to compute loss (item→item only)
         training: bool = True,
     ) -> Dict[str, jnp.ndarray]:
         """
         Forward pass through Llama + EfficientIDS.
 
         Args:
-            input_ids: [batch, seq_len] text token IDs
-            item_ids: [batch, seq_len] item IDs (for positions with items)
-            item_mask: [batch, seq_len] mask (1 for item positions, 0 for text)
+            input_ids: [batch, seq_len] token IDs (interleaved text + items)
+            item_weights: [batch, seq_len] - 0 for text tokens, 1 for item tokens
             attention_mask: [batch, seq_len] attention mask
             targets: [batch, seq_len] target item IDs (for training)
+            loss_mask: [batch, seq_len] - 1 where loss should be computed, 0 elsewhere
+                       For text_metadata: only item→item positions
+                       For id_only: all non-padding positions
             training: Whether in training mode
 
         Returns:
@@ -539,6 +546,12 @@ class LlamaEfficientIDSModel(nn.Module):
 
 if __name__ == "__main__":
     """Test the models with synthetic data."""
+
+    # Import ClusteringInfo for testing
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from data.dataset import ClusteringInfo
 
     print("Testing EfficientIDS Models")
     print("=" * 60)

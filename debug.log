@@ -1,0 +1,138 @@
+(venv_flax) [root@/repo/uber/ai/michelangelo/sdk/inference/triton_and_llm_inference/efficientids_flax #]python train_efficientids.py --config debug
+INFO:absl:Created `ArrayHandler` with primary_host=0, replica_id=0
+INFO:__main__:================================================================================
+INFO:__main__:EfficientIDS Training (Flax Port)
+INFO:__main__:================================================================================
+INFO:__main__:
+Configuration: debug
+INFO:__main__:  Data dir: ./data/ml1m_processed/processed
+INFO:__main__:  Checkpoint dir: /tmp/efficientids_debug
+INFO:__main__:  Max steps: 200
+INFO:__main__:  Batch size: 4
+INFO:__main__:
+================================================================================
+INFO:__main__:Loading data...
+INFO:__main__:================================================================================
+INFO:data.dataset:Loaded metadata embeddings: (3260, 118)
+INFO:data.dataset:Metadata: 3260 items, 100 clusters
+INFO:data.dataset:Limited to 100 sequences
+INFO:data.dataset:Loaded 100 sequences from data/ml1m_processed/processed/train_sequences.pkl
+INFO:data.dataset:✅ Initialized train dataset: 100 sequences
+INFO:data.dataset:Loaded metadata embeddings: (3260, 118)
+INFO:data.dataset:Metadata: 3260 items, 100 clusters
+INFO:data.dataset:Limited to 20 sequences
+INFO:data.dataset:Loaded 20 sequences from data/ml1m_processed/processed/val_sequences.pkl
+INFO:data.dataset:✅ Initialized val dataset: 20 sequences
+INFO:data.dataset:Loaded metadata embeddings: (3260, 118)
+INFO:data.dataset:Metadata: 3260 items, 100 clusters
+INFO:data.dataset:Loaded 4822 sequences from data/ml1m_processed/processed/test_sequences.pkl
+INFO:data.dataset:✅ Initialized test dataset: 4822 sequences
+INFO:__main__:Train dataset: 100 sequences
+INFO:__main__:Val dataset: 20 sequences
+INFO:__main__:Test dataset: 4822 sequences
+INFO:__main__:
+================================================================================
+INFO:__main__:Creating model...
+INFO:__main__:================================================================================
+INFO:__main__:Model created:
+INFO:__main__:  Items: 100
+INFO:__main__:  Clusters: 10
+INFO:__main__:  Item embedding dim: 64
+INFO:__main__:  Model dims: 128
+INFO:__main__:  Hierarchical softmax: True
+INFO:__main__:
+================================================================================
+INFO:__main__:Creating optimizer...
+INFO:__main__:================================================================================
+INFO:__main__:Optimizer created:
+INFO:__main__:  Type: adamw
+INFO:__main__:  Learning rate: 0.001
+INFO:__main__:  Schedule: cosine
+INFO:__main__:  Weight decay: 0.01
+INFO:__main__:  Warmup steps: 50
+INFO:__main__:
+================================================================================
+INFO:__main__:Creating trainer...
+INFO:__main__:================================================================================
+WARNING:absl:Configured `CheckpointManager` using deprecated legacy API. Please follow the instructions at https://orbax.readthedocs.io/en/latest/api_refactor.html to migrate by August 1st, 2024.
+INFO:absl:Initialized item_names=(), _known_handlers={'default': <orbax.checkpoint.standard_checkpoint_handler.StandardCheckpointHandler object at 0x7f159d17b5e0>, 'metrics': <orbax.checkpoint.json_checkpoint_handler.JsonCheckpointHandler object at 0x7f159d17b0d0>}
+INFO:jax._src.xla_bridge:Unable to initialize backend 'rocm': module 'jaxlib.xla_extension' has no attribute 'GpuAllocatorConfig'
+INFO:jax._src.xla_bridge:Unable to initialize backend 'tpu': INTERNAL: Failed to open libtpu.so: libtpu.so: cannot open shared object file: No such file or directory
+INFO:absl:Skipping global process sync, barrier name: CheckpointManager:create_directory
+INFO:absl:Found 0 checkpoint steps in /tmp/efficientids_debug
+INFO:absl:Failed to get flag value for EXPERIMENTAL_ORBAX_USE_DISTRIBUTED_PROCESS_ID.
+INFO:absl:CheckpointManager created, jax.process_index=0, primary_host=0, CheckpointManagerOptions=CheckpointManagerOptions(save_interval_steps=100, max_to_keep=5, keep_time_interval=None, keep_period=None, best_fn=None, best_mode='max', keep_checkpoints_without_metrics=True, step_prefix=None, step_format_fixed_length=None, step_name_format=None, create=True, cleanup_tmp_directories=False, save_on_steps=frozenset(), single_host_load_and_broadcast=False, todelete_subdir=None, enable_background_delete=False, read_only=False, enable_async_checkpointing=True, async_options=AsyncOptions(timeout_secs=None, barrier_sync_fn=None, post_finalization_callback=None), multiprocessing_options=MultiprocessingOptions(primary_host=0, active_processes=None, barrier_sync_key_prefix=None), should_save_fn=None, file_options=FileOptions(path_permission_mode=None), temporary_path_class=None), root_directory=/tmp/efficientids_debug: <orbax.checkpoint.checkpoint_manager.CheckpointManager object at 0x7f159d17b130>
+INFO:__main__:Trainer created
+INFO:__main__:
+================================================================================
+INFO:__main__:Initializing training state...
+INFO:__main__:================================================================================
+INFO:__main__:Model initialized with 11,200 parameters
+INFO:__main__:
+================================================================================
+INFO:__main__:Starting training...
+INFO:__main__:================================================================================
+Starting training for 200 steps...
+  Logging every 20 steps
+  Evaluating every 50 steps
+  Saving every 100 steps
+
+Step 20/200 | Loss: nan | Grad norm: nan | Cluster acc: 0.016 | 14.1 steps/s
+  Dataset exhausted at step 25, stopping...
+
+Training completed! Final step: 50
+INFO:absl:Saving checkpoint at step 50
+INFO:absl:Saving checkpoint to /tmp/efficientids_debug/50.
+INFO:absl:Creating tmp directory /tmp/efficientids_debug/50.orbax-checkpoint-tmp-0
+INFO:absl:Skipping global process sync, barrier name: create_tmp_directory:pre.50.1
+INFO:absl:Wrote CheckpointMetadata=CheckpointMetadata(init_timestamp_nsecs=1762561705666635507, commit_timestamp_nsecs=None), json={"init_timestamp_nsecs": 1762561705666635507, "commit_timestamp_nsecs": null} to /tmp/efficientids_debug/50.orbax-checkpoint-tmp-0
+INFO:absl:Skipping global process sync, barrier name: create_tmp_directory:post.50.2
+INFO:absl:Creating tmp directory /tmp/efficientids_debug/50.orbax-checkpoint-tmp-0/default.orbax-checkpoint-tmp-3
+INFO:absl:Skipping global process sync, barrier name: create_tmp_directory:pre.default.4
+INFO:absl:Skipping global process sync, barrier name: create_tmp_directory:post.default.5
+INFO:absl:Skipping global process sync, barrier name: Checkpointer:save.50
+INFO:absl:Renaming /tmp/efficientids_debug/50.orbax-checkpoint-tmp-0/default.orbax-checkpoint-tmp-3 to /tmp/efficientids_debug/50.orbax-checkpoint-tmp-0/default
+INFO:absl:Renaming /tmp/efficientids_debug/50.orbax-checkpoint-tmp-0 to /tmp/efficientids_debug/50
+INFO:absl:Read CheckpointMetadata=CheckpointMetadata(init_timestamp_nsecs=1762561705666635507, commit_timestamp_nsecs=None) from /tmp/efficientids_debug/50.orbax-checkpoint-tmp-0
+INFO:absl:Updated CheckpointMetadata=CheckpointMetadata(init_timestamp_nsecs=1762561705666635507, commit_timestamp_nsecs=1762561705692636937) to /tmp/efficientids_debug/50.orbax-checkpoint-tmp-0
+INFO:absl:Finished saving checkpoint to `/tmp/efficientids_debug/50`.
+INFO:absl:Skipping global process sync, barrier name: Checkpointer:finalize.50
+INFO:absl:Skipping global process sync, barrier name: CheckpointManager:old_steps_to_remove.50
+INFO:absl:Finished synchronous save.
+INFO:absl:Skipping global process sync, barrier name: CheckpointManager:finalize.50
+INFO:absl:{'step': Array(50, dtype=int32, weak_type=True), 'event_type': 'save', 'directory': '/tmp/efficientids_debug', 'reached_preemption': False, 'preemption_received_at': None, 'synchronous': True, 'wait_for_prev_start_time': 1762561705.6658244, 'wait_for_prev_duration_secs': 3.0994415283203125e-06, 'checkpointer_blocking_start_time': 1762561705.6661935, 'checkpointer_blocking_duration_secs': 0.027002334594726562, 'get_old_steps_start_time': 1762561705.6932333, 'get_old_steps_duration_secs': 5.7220458984375e-06, 'checkpoint_manager_blocking_start_time': 1762561705.6657708, 'checkpoint_manager_blocking_duration_secs': 0.027629852294921875}
+INFO:__main__:
+================================================================================
+INFO:__main__:Final evaluation on test set...
+INFO:__main__:================================================================================
+INFO:__main__:
+Final Test Metrics:
+INFO:__main__:================================================================================
+INFO:__main__:  accuracy@1          : 0.0000
+INFO:__main__:  accuracy@5          : 0.0000
+INFO:__main__:  mrr@1               : 0.0000
+INFO:__main__:  mrr@5               : 0.0004
+INFO:__main__:  ndcg@1              : 0.0000
+INFO:__main__:  ndcg@5              : 0.0005
+INFO:__main__:  recall@1            : 0.0000
+INFO:__main__:  recall@5            : 0.0010
+INFO:__main__:
+================================================================================
+INFO:__main__:Training completed successfully!
+INFO:__main__:================================================================================
+INFO:__main__:Final checkpoint saved to: /tmp/efficientids_debug
+INFO:__main__:Total steps: 50
+
+================================================================================
+🎉 Training completed!
+================================================================================
+
+Final metrics:
+  accuracy@1: 0.0000
+  accuracy@5: 0.0000
+  mrr@1: 0.0000
+  mrr@5: 0.0004
+  ndcg@1: 0.0000
+  ndcg@5: 0.0005
+  recall@1: 0.0000
+  recall@5: 0.0010

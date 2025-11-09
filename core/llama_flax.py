@@ -208,22 +208,32 @@ class LlamaModel(nn.Module):
         Returns:
             last_hidden_state: [batch, seq_len, hidden_size]
         """
+        # Embedding layer
+        embed_tokens = nn.Embed(
+            num_embeddings=self.vocab_size,
+            features=self.hidden_size,
+            name='embed_tokens',
+        )
+
         # Get embeddings
         if inputs_embeds is None:
-            embed_tokens = nn.Embed(
-                num_embeddings=self.vocab_size,
-                features=self.hidden_size,
-                name='embed_tokens',
-            )
             x = embed_tokens(input_ids)
         else:
             x = inputs_embeds
 
         batch_size, seq_len, _ = x.shape
 
-        # Create causal mask
+        # Create or adjust attention mask to match sequence length
         if attention_mask is None:
             attention_mask = jnp.ones((batch_size, seq_len))
+        else:
+            # Ensure attention_mask matches seq_len (truncate or pad if needed)
+            if attention_mask.shape[1] != seq_len:
+                if attention_mask.shape[1] > seq_len:
+                    attention_mask = attention_mask[:, :seq_len]
+                else:
+                    pad_len = seq_len - attention_mask.shape[1]
+                    attention_mask = jnp.pad(attention_mask, ((0, 0), (0, pad_len)), constant_values=0)
 
         # Convert attention mask to additive form
         # 1 -> 0 (attend), 0 -> -inf (don't attend)
@@ -310,4 +320,3 @@ if __name__ == "__main__":
     print("\nMemory usage:")
     print(f"  Model params: ~{num_params * 2 / 1e9:.2f} GB (bfloat16)")
     print(f"  No OOM issues - all initialized on-demand!")
-

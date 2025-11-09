@@ -28,11 +28,12 @@ orbax-checkpoint==0.5.23
 
 # Model loading (for pretrained LMs) - optional, comment out if not needed
 # transformers==4.44.0
-# sentencepiece==0.2.0
+sentencepiece==0.2.0
 
-# Data processing - optional, comment out if not needed
+# Data processing
 numpy==1.26.4
-# tensorflow==2.16.1  # Only needed for data pipeline
+joblib==1.4.2
+# tensorflow==2.16.1  # Only needed for SeqIO pipeline
 # tensorflow-datasets==4.9.6
 
 # Utilities
