@@ -361,16 +361,15 @@ def get_tpu_optimized_config(
     - Pretrained Gemma 2B (or Llama) - FROZEN
     - Item embeddings from metadata (384 dim)
     - Model dims from pretrained LM (2048 for Gemma 2B)
-    - Memory optimizations: remat + bfloat16 + gradient accumulation
+    - Memory optimizations: remat + bfloat16
 
-    Optimizations for TPU (509MB available):
-    - Batch size: 2 (very small)
-    - Gradient accumulation: 8 (effective batch = 16)
+    Optimized for TPU v6e-4 (4 chips, 64GB total):
+    - Batch size: 16 (4 per device) - JAX auto-parallelizes across 4 chips
     - Gradient checkpointing (remat): ~50% memory savings
     - Mixed precision (bfloat16): ~50% memory savings + faster on TPU
     - Frozen LM: Only train item embeddings + adapters (saves memory)
 
-    Expected memory: ~500MB with Gemma 2B frozen
+    Expected memory: ~4GB per chip with Gemma 2B frozen
     """
     return EfficientIDSConfig(
         model=ModelConfig(
@@ -386,8 +385,8 @@ def get_tpu_optimized_config(
         training=TrainingConfig(
             max_steps=max_steps,
             warmup_steps=1000,
-            batch_size=1,  # Minimal batch size for TPU v6e-1
-            eval_batch_size=2,
+            batch_size=16,  # Total batch across 4 devices (4 per chip)
+            eval_batch_size=16,
             max_seq_len=max_seq_len,
             learning_rate=5e-5,  # Lower LR for pretrained model
             schedule_type='cosine',
@@ -400,7 +399,7 @@ def get_tpu_optimized_config(
             # MEMORY OPTIMIZATIONS
             use_remat=True,  # Gradient checkpointing
             use_mixed_precision=True,  # bfloat16 training
-            gradient_accumulation_steps=8,  # Effective batch = 16
+            gradient_accumulation_steps=1,  # No accumulation needed with 4 chips
         ),
         data=DataConfig(
             data_dir="./data/ml1m_processed/processed",

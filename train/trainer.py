@@ -136,26 +136,48 @@ class Trainer:
         if pretrained_params is not None:
             params = self._merge_pretrained_params(params, pretrained_params)
 
-        # If freezing transformer, create optimizer that only tracks trainable params
+        # Implement BPROP_VARIABLE_EXCLUSION like Paxml
         if freeze_transformer:
-            print("🔒 Freezing transformer - optimizer will only track adapters + item embeddings")
+            print("🔒 Freezing transformer (BPROP_VARIABLE_EXCLUSION like Paxml)")
             import optax
+            import re
 
-            # Use masking approach: multiply gradients by 0 for frozen params
-            def mask_fn(params):
-                """Create a mask: 0 for frozen params, 1 for trainable."""
-                def _is_trainable(path, _):
-                    path_str = '/'.join(str(k.key) if hasattr(k, 'key') else str(k) for k in path)
-                    # Trainable if NOT in gemma_transformer
-                    return 0.0 if 'gemma_transformer' in path_str else 1.0
+            # Paxml-style exclusion patterns
+            exclusion_patterns = [
+                r'gemma_transformer/.*',  # Freeze entire transformer
+            ]
 
-                return jax.tree_util.tree_map_with_path(_is_trainable, params)
+            def matches_exclusion(path_str):
+                """Check if parameter path matches any exclusion pattern."""
+                return any(re.match(pattern, path_str) for pattern in exclusion_patterns)
 
-            mask = mask_fn(params)
+            def partition_fn(path, value):
+                """Partition params: 'frozen' or 'trainable' (Paxml behavior)."""
+                path_parts = []
+                for key in path:
+                    if hasattr(key, 'key'):
+                        path_parts.append(str(key.key))
+                    else:
+                        path_parts.append(str(key))
+                path_str = '/'.join(path_parts)
+                return 'frozen' if matches_exclusion(path_str) else 'trainable'
 
-            # Wrap optimizer with masking
-            optimizer = optax.chain(
-                optax.masked(self.optimizer, mask),
+            # Count params (like Paxml does)
+            from flax.traverse_util import flatten_dict
+            flat_params = flatten_dict(params, sep='/')
+            frozen_count = sum(v.size for k, v in flat_params.items() if matches_exclusion(k))
+            trainable_count = sum(v.size for k, v in flat_params.items() if not matches_exclusion(k))
+            print(f"   Trainable: {trainable_count:,} params")
+            print(f"   Frozen: {frozen_count:,} params")
+
+            # Use multi_transform: trainable gets optimizer, frozen gets zero gradients
+            # This is exactly what Paxml's bprop_variable_exclusion does
+            optimizer = optax.multi_transform(
+                {
+                    'trainable': self.optimizer,
+                    'frozen': optax.set_to_zero(),  # Skip gradients for frozen params
+                },
+                partition_fn
             )
         else:
             optimizer = self.optimizer
@@ -337,8 +359,13 @@ class Trainer:
         Returns:
             Final train state and final metrics
         """
+        # Check device setup
+        devices = jax.devices()
         print(f"\n🚀 Starting training for {num_steps} steps...")
         print(f"   Platform: {self.platform.upper()}")
+        print(f"   Devices: {len(devices)} x {devices[0].platform}")
+        if len(devices) > 1:
+            print(f"   Data parallelism: ENABLED (batch split across {len(devices)} devices)")
         print(f"   Logging every {self.log_every} steps")
         print(f"   Evaluating every {self.eval_every} steps")
         print(f"   Saving every {self.save_every} steps")
