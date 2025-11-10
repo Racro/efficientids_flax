@@ -139,23 +139,24 @@ class Trainer:
         # If freezing transformer, create optimizer that only tracks trainable params
         if freeze_transformer:
             print("🔒 Freezing transformer - optimizer will only track adapters + item embeddings")
-            # Create partition: False = frozen (no optimizer state), True = trainable
-            partition = jax.tree.map(
-                lambda path: 'gemma_transformer' not in '/'.join(str(p) for p in path),
-                params,
-                is_leaf=lambda x: False  # Don't treat any node as leaf
-            )
-            # For now, use simple approach: just exclude 'gemma_transformer' from updates
-            # Full implementation would use optax.masked
             import optax
-            tx = optax.multi_transform(
-                {
-                    'trainable': self.optimizer,
-                    'frozen': optax.set_to_zero(),  # No updates for frozen params
-                },
-                lambda path, _: 'trainable' if 'gemma_transformer' not in '/'.join(str(p) for p in path) else 'frozen'
+
+            # Use masking approach: multiply gradients by 0 for frozen params
+            def mask_fn(params):
+                """Create a mask: 0 for frozen params, 1 for trainable."""
+                def _is_trainable(path, _):
+                    path_str = '/'.join(str(k.key) if hasattr(k, 'key') else str(k) for k in path)
+                    # Trainable if NOT in gemma_transformer
+                    return 0.0 if 'gemma_transformer' in path_str else 1.0
+
+                return jax.tree_util.tree_map_with_path(_is_trainable, params)
+
+            mask = mask_fn(params)
+
+            # Wrap optimizer with masking
+            optimizer = optax.chain(
+                optax.masked(self.optimizer, mask),
             )
-            optimizer = tx
         else:
             optimizer = self.optimizer
 
