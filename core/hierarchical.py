@@ -94,8 +94,12 @@ class HierarchicalSoftmax(nn.Module):
                 loss_mask=loss_mask,
             )
         else:
-            dummy_logits = jnp.zeros(hidden_states.shape[:-1] + (self.num_items,))
-            return dummy_logits, {}
+            # Inference: compute full logits for all items
+            logits = self._compute_inference_logits(
+                hidden_states=hidden_states,
+                item_embeddings=item_embeddings,
+            )
+            return logits, {}
 
     def _compute_training_loss(
         self,
@@ -215,3 +219,27 @@ class HierarchicalSoftmax(nn.Module):
         # Return dummy logits
         dummy_logits = jnp.zeros(hidden_states.shape[:-1] + (self.num_items,))
         return dummy_logits, metrics
+
+    def _compute_inference_logits(
+        self,
+        hidden_states: jnp.ndarray,  # [batch, seq_len, model_dims]
+        item_embeddings: jnp.ndarray,  # [num_items, item_embedding_dim]
+    ) -> jnp.ndarray:
+        """
+        Compute full item logits for inference.
+
+        Since we use adapters, we need to project item embeddings to model space first.
+
+        Args:
+            hidden_states: [batch, seq_len, model_dims] (e.g., 2048)
+            item_embeddings: [num_items, item_embedding_dim] (e.g., 384)
+
+        Returns:
+            logits: [batch, seq_len, num_items]
+        """
+        # Project item embeddings to model space (384 -> 2048)
+        item_embeddings_projected = self.item_input_adapter(item_embeddings)  # [num_items, model_dims]
+
+        # Compute logits in model space
+        logits = jnp.einsum('...d,id->...i', hidden_states, item_embeddings_projected)
+        return logits

@@ -154,6 +154,39 @@ class ItemOutputAdapter(nn.Module):
         return adapter(hidden_states)
 
 
+class ClusterInputAdapter(nn.Module):
+    """
+    Projects cluster embeddings → transformer space.
+
+    cluster_embedding_dim → hidden_dim → model_dims
+
+    Example: 118 → 1024 → 2048 (for Gemma 2B with metadata clusters)
+    """
+    cluster_embedding_dim: int
+    model_dims: int
+    hidden_dim: int = 1024
+    num_layers: int = 2
+
+    @nn.compact
+    def __call__(self, cluster_embeddings: jnp.ndarray) -> jnp.ndarray:
+        """
+        Args:
+            cluster_embeddings: [num_clusters, cluster_embedding_dim]
+
+        Returns:
+            transformer_embeddings: [num_clusters, model_dims]
+        """
+        # MLP projection
+        adapter = MLPAdapter(
+            hidden_dim=self.hidden_dim,
+            output_dim=self.model_dims,
+            num_layers=self.num_layers,
+            name='cluster_input_adapter'
+        )
+
+        return adapter(cluster_embeddings)
+
+
 def create_embedding_initializer(embedding_array: jnp.ndarray) -> Callable:
     """
     Create a Flax initializer from a pretrained embedding array.

@@ -124,11 +124,23 @@ class Trainer:
             Merged parameters
         """
         import copy
+        import logging
+        logger = logging.getLogger(__name__)
+
         merged = copy.deepcopy(initialized_params)
+
+        # Debug: Check what we're merging
+        logger.info(f"  Initialized params keys: {list(initialized_params.keys())}")
+        logger.info(f"  Pretrained params keys: {list(pretrained_params.keys())}")
 
         # Merge transformer parameters if present
         if 'transformer' in pretrained_params and 'transformer' in merged:
+            logger.info(f"  ✓ Merging transformer weights from pretrained checkpoint")
             merged['transformer'] = pretrained_params['transformer']
+        else:
+            logger.warning(f"  ✗ Could not merge transformer weights!")
+            logger.warning(f"    'transformer' in pretrained: {'transformer' in pretrained_params}")
+            logger.warning(f"    'transformer' in initialized: {'transformer' in merged}")
 
         return merged
 

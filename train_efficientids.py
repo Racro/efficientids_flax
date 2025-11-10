@@ -144,12 +144,32 @@ def create_gemma_model(config: EfficientIDSConfig, clustering_info: ClusteringIn
         gemma_params = load_gemma_params(pretrained_path)
         logger.info(f"  ✓ Loaded Gemma checkpoint")
 
+        # Debug: Check what we loaded
+        if 'transformer' in gemma_params:
+            logger.info(f"  Found 'transformer' key in checkpoint")
+            transformer_keys = list(gemma_params['transformer'].keys())
+            logger.info(f"  Transformer has {len(transformer_keys)} keys")
+            logger.info(f"  First 3 keys: {transformer_keys[:3]}")
+
         # Reshape params for Flax
         gemma_params_flax = reshape_gemma_params_for_flax(gemma_params)
         logger.info(f"  ✓ Reshaped params for Flax")
+
+        # Debug: Check reshaped structure
+        if gemma_params_flax:
+            logger.info(f"  Reshaped params have {len(gemma_params_flax)} top-level keys")
+            logger.info(f"  Keys: {list(gemma_params_flax.keys())[:5]}")
+            if 'transformer' in gemma_params_flax:
+                transformer = gemma_params_flax['transformer']
+                logger.info(f"  Transformer has {len(transformer)} keys")
+                logger.info(f"  Transformer keys: {list(transformer.keys())[:3]}")
+                if 'layer_0' in transformer:
+                    logger.info(f"  Layer 0 keys: {list(transformer['layer_0'].keys())}")
     except Exception as e:
         logger.warning(f"  Failed to load checkpoint: {e}")
         logger.warning(f"  Will initialize from scratch")
+        import traceback
+        traceback.print_exc()
         gemma_params_flax = None
 
     # Create model with Gemma dimensions
@@ -394,7 +414,7 @@ if __name__ == "__main__":
     parser.add_argument(
         '--pretrained_path',
         type=str,
-        default='./2b',
+        default='/repo/uber/ai/michelangelo/sdk/inference/triton_and_llm_inference/2b',
         help='Path to pretrained model checkpoint'
     )
     parser.add_argument(

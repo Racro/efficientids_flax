@@ -11,8 +11,8 @@ from typing import Optional, Dict, Any
 import orbax.checkpoint as ocp
 
 # EfficientIDS imports
-from .hierarchical_simple import SimpleHierarchicalSoftmax, JaxClusteringInfo
-from .embeddings import ItemInputAdapter, ItemOutputAdapter
+from .hierarchical import HierarchicalSoftmax, ClusteringInfo
+from .embeddings import ItemInputAdapter, ItemOutputAdapter, ClusterInputAdapter
 
 
 class RMSNorm(nn.Module):
@@ -45,15 +45,22 @@ class GroupedQueryAttention(nn.Module):
         batch_size, seq_len, hidden_dim = x.shape
 
         # Q projection: [batch, seq, hidden] -> [batch, seq, num_heads, head_dim]
+        # Gemma kernel shape: (num_heads, hidden_dim, head_dim)
         q = nn.DenseGeneral(
             features=(self.num_heads, self.head_dim),
+            axis=-1,  # Apply on last axis (hidden_dim)
+            use_bias=False,  # Gemma doesn't use bias
+            kernel_init=nn.initializers.normal(),
             name='q_einsum'
         )(x)
 
         # KV projection: [batch, seq, hidden] -> [batch, seq, num_kv_heads, head_dim]
+        # Gemma kernel shape: (num_kv_heads, 1, hidden_dim, head_dim)
         kv = nn.DenseGeneral(
             features=(self.num_kv_heads, self.head_dim),
             axis=-1,
+            use_bias=False,  # Gemma doesn't use bias
+            kernel_init=nn.initializers.normal(),
             name='kv_einsum'
         )(x)
 
@@ -91,6 +98,7 @@ class GroupedQueryAttention(nn.Module):
         output = nn.DenseGeneral(
             features=hidden_dim,
             axis=(-2, -1),
+            use_bias=False,  # Gemma doesn't use bias
             name='attn_vec_einsum'
         )(attn_output)
 
@@ -111,8 +119,9 @@ class GemmaMLP(nn.Module):
     def __call__(self, x):
         # Gating projection: [batch, seq, hidden] -> [batch, seq, intermediate]
         # Gemma stores both gate and up in same einsum (2, hidden, intermediate)
-        gating = nn.DenseGeneral(
+        gating = nn.Dense(
             features=self.intermediate_dim,
+            use_bias=False,  # Gemma doesn't use bias
             name='gating_einsum'
         )(x)
 
@@ -122,6 +131,7 @@ class GemmaMLP(nn.Module):
         # Linear projection: [batch, seq, intermediate] -> [batch, seq, hidden]
         output = nn.Dense(
             features=self.hidden_dim,
+            use_bias=False,  # Gemma doesn't use bias
             name='linear'
         )(gating)
 
@@ -220,72 +230,102 @@ def reshape_gemma_params_for_flax(gemma_params: Dict[str, Any]) -> Dict[str, Any
     """
     Reshape Gemma checkpoint params to match our Flax model structure.
 
-    Gemma checkpoint structure:
-        transformer/layer_X/attn/{q_einsum,kv_einsum,attn_vec_einsum}/w
-        transformer/layer_X/mlp/{gating_einsum,linear}/w
-        transformer/layer_X/{pre_attention_norm,pre_ffw_norm}/scale
-        transformer/final_norm/scale
+    Gemma checkpoint is a FLAT dict with keys like:
+        'transformer/layer_0/attn/q_einsum' -> {'w': array}
+        'transformer/final_norm' -> {'scale': array}
 
-    Our Flax structure:
-        layer_X/attn/{q_einsum,kv_einsum,attn_vec_einsum}/kernel
-        layer_X/mlp/{gating_einsum,linear}/kernel
-        layer_X/{pre_attention_norm,pre_ffw_norm}/scale
-        final_norm/scale
+    We need to convert to NESTED Flax structure:
+        {'transformer': {'layer_0': {'attn': {'q_einsum': {'kernel': array}}}}}
 
     Args:
-        gemma_params: Raw Gemma checkpoint params
+        gemma_params: Flat Gemma checkpoint dict
 
     Returns:
-        Reshaped params matching Flax model
+        Nested params matching Flax model structure
     """
-    transformer_params = gemma_params.get('transformer', gemma_params)
-    flax_params = {}
+    import logging
+    import jax.numpy as jnp
+    logger = logging.getLogger(__name__)
 
-    # Process each layer
-    for i in range(18):
-        layer_key = f'layer_{i}'
-        if layer_key not in transformer_params:
+    logger.info(f"  [reshape] Converting flat checkpoint ({len(gemma_params)} keys) to nested structure")
+
+    # Build nested structure
+    nested = {}
+
+    for flat_key, value_dict in gemma_params.items():
+        # Split path: 'transformer/layer_0/attn/q_einsum' -> ['transformer', 'layer_0', 'attn', 'q_einsum']
+        parts = flat_key.split('/')
+
+        # Skip non-transformer keys
+        if parts[0] != 'transformer':
             continue
 
-        layer_params = transformer_params[layer_key]
-        flax_layer = {}
+        # Navigate/create nested structure
+        current = nested
+        for part in parts[:-1]:  # All except last part
+            if part not in current:
+                current[part] = {}
+            current = current[part]
 
-        # Attention params
-        if 'attn' in layer_params:
-            attn_params = layer_params['attn']
-            flax_attn = {}
+        # Last part is the parameter name
+        param_name = parts[-1]
 
-            # Q, KV, output projections (rename 'w' -> 'kernel')
-            for param_name in ['q_einsum', 'kv_einsum', 'attn_vec_einsum']:
-                if param_name in attn_params and 'w' in attn_params[param_name]:
-                    flax_attn[param_name] = {'kernel': attn_params[param_name]['w']}
+        # Convert 'w' -> 'kernel' and transpose to match Flax DenseGeneral
+        if 'w' in value_dict:
+            w = value_dict['w']
 
-            flax_layer['attn'] = flax_attn
+            # Convert bfloat16 to float32 for compatibility
+            if w.dtype == jnp.bfloat16:
+                w = w.astype(jnp.float32)
 
-        # MLP params
-        if 'mlp' in layer_params:
-            mlp_params = layer_params['mlp']
-            flax_mlp = {}
+            # Transpose Gemma einsum weights to match Flax DenseGeneral
+            # Gemma uses einsum convention: (output_dims..., input_dim)
+            # Flax DenseGeneral expects: (input_dim, output_dims...)
+            if param_name in ['q_einsum', 'kv_einsum']:
+                # Q: (num_heads, hidden, head_dim) -> (hidden, num_heads, head_dim)
+                # KV: (num_kv_heads, 1, hidden, head_dim) -> (hidden, 1, head_dim)
+                if w.ndim == 4:  # KV has shape (2, 1, 2048, 256)
+                    # Gemma uses 2 for k/v, but we only need one (they're the same)
+                    w = w[0]  # Take first: (2, 1, 2048, 256) -> (1, 2048, 256)
+                    w = w.squeeze(0)  # -> (2048, 256)
+                    # Add back the num_kv_heads dimension: (2048, 256) -> (2048, 1, 256)
+                    w = w[:, None, :]
+                else:
+                    # Q: (num_heads, hidden, head_dim) -> (hidden, num_heads, head_dim)
+                    w = jnp.transpose(w, (1, 0, 2))
+            elif param_name == 'attn_vec_einsum':
+                # Output: (num_heads, head_dim, hidden) -> (head_dim, num_heads, hidden) [NOT NEEDED]
+                # Actually for DenseGeneral with axis=(-2,-1), we need (num_heads, head_dim, hidden)
+                # So no transpose needed, but actually yes: (8, 256, 2048) stays as is
+                pass  # Keep as-is
+            elif param_name == 'gating_einsum':
+                # Gating: (2, hidden, intermediate) -> (hidden, intermediate)
+                # Take first slice (gate part)
+                w = w[0]  # (2, 2048, 16384) -> (2048, 16384)
+            elif param_name == 'linear':
+                # Linear: (intermediate, hidden) - already correct for Dense
+                pass
 
-            # Gating and linear projections
-            for param_name in ['gating_einsum', 'linear']:
-                if param_name in mlp_params and 'w' in mlp_params[param_name]:
-                    flax_mlp[param_name] = {'kernel': mlp_params[param_name]['w']}
+            current[param_name] = {'kernel': w}
+        elif 'scale' in value_dict:
+            scale = value_dict['scale']
+            # Convert bfloat16 to float32 for compatibility
+            if scale.dtype == jnp.bfloat16:
+                scale = scale.astype(jnp.float32)
+            current[param_name] = {'scale': scale}
+        else:
+            # Copy as-is for other params (like embeddings)
+            current[param_name] = value_dict
 
-            flax_layer['mlp'] = flax_mlp
+    # Count layers found
+    if 'transformer' in nested:
+        layers_found = sum(1 for k in nested['transformer'].keys() if k.startswith('layer_'))
+        logger.info(f"  [reshape] Found {layers_found}/18 transformer layers")
+        logger.info(f"  [reshape] Nested structure keys: {list(nested.keys())}")
+        if 'transformer' in nested:
+            logger.info(f"  [reshape] Transformer keys: {list(nested['transformer'].keys())[:5]}")
 
-        # RMSNorm params
-        for norm_name in ['pre_attention_norm', 'pre_ffw_norm']:
-            if norm_name in layer_params and 'scale' in layer_params[norm_name]:
-                flax_layer[norm_name] = {'scale': layer_params[norm_name]['scale']}
-
-        flax_params[layer_key] = flax_layer
-
-    # Final norm
-    if 'final_norm' in transformer_params and 'scale' in transformer_params['final_norm']:
-        flax_params['final_norm'] = {'scale': transformer_params['final_norm']['scale']}
-
-    return flax_params
+    return nested
 
 
 class GemmaEfficientIDSModel(nn.Module):
@@ -294,10 +334,15 @@ class GemmaEfficientIDSModel(nn.Module):
 
     Architecture:
     1. Item embeddings (num_items, 384)
-    2. Input adapter (384 -> 2048)
+    2. Input adapter (384 -> 2048) - projects items to Gemma space
     3. Gemma transformer (18 layers, 2048 hidden)
-    4. Output adapter (2048 -> 384)
-    5. Hierarchical softmax (cluster + item)
+    4. Hierarchical softmax at 2048-dim (using full hierarchical.py)
+       - Item input adapter: 384 -> 2048
+       - Cluster input adapter: 118 -> 2048
+       - All computations in model space (2048-dim)
+
+    This uses the full hierarchical softmax (hierarchical.py) instead of
+    hierarchical_simple.py to maximize Gemma's representational capacity.
 
     Args:
         num_items: Number of items
@@ -346,6 +391,7 @@ class GemmaEfficientIDSModel(nn.Module):
 
         # ==================== ADAPTERS ====================
         # Project item embeddings to Gemma space (384 → 2048)
+        # This adapter is used by hierarchical softmax, not here
         item_input_adapter = ItemInputAdapter(
             item_embedding_dim=self.item_embedding_dim,
             model_dims=self.model_dims,
@@ -354,14 +400,8 @@ class GemmaEfficientIDSModel(nn.Module):
             name='item_input_adapter'
         )
 
-        # Project Gemma outputs to item space (2048 → 384)
-        item_output_adapter = ItemOutputAdapter(
-            model_dims=self.model_dims,
-            item_embedding_dim=self.item_embedding_dim,
-            hidden_dim=self.item_embedding_dim * 4,
-            num_layers=2,
-            name='item_output_adapter'
-        )
+        # NOTE: We don't use ItemOutputAdapter here because hierarchical softmax
+        # operates directly in model space (2048-dim) for better capacity
 
         # ==================== FORWARD PASS ====================
         # Embed items
@@ -392,27 +432,47 @@ class GemmaEfficientIDSModel(nn.Module):
         else:
             model_outputs = gemma_transformer(model_space_embs, mask=mask)
 
-        # Project back to item space
-        item_space_hidden = item_output_adapter(model_outputs)  # [batch, seq_len, 384]
-
         # ==================== HIERARCHICAL SOFTMAX ====================
-        if self.clustering_info is not None and training and targets is not None:
-            jax_clustering = JaxClusteringInfo.from_numpy_clustering_info(self.clustering_info)
+        # Use full hierarchical softmax at model dimension (2048)
+        # This avoids projecting down to 384 then back up
 
-            hierarchical_softmax = SimpleHierarchicalSoftmax(
+        if self.clustering_info is not None:
+            # Convert dataset ClusteringInfo to hierarchical.py ClusteringInfo format
+            # Dataset has cluster_centers, hierarchical.py expects cluster_embeddings
+            hierarchical_clustering_info = ClusteringInfo(
+                cluster_assignments=self.clustering_info.cluster_assignments,
+                cluster_indices=self.clustering_info.cluster_indices,
+                in_cluster_id=self.clustering_info.in_cluster_id,
+                cluster_embeddings=self.clustering_info.cluster_centers,  # Rename cluster_centers -> cluster_embeddings
+            )
+
+            # Create cluster input adapter (cluster_dim -> 2048)
+            # Cluster embeddings are typically lower-dim (e.g., 118 for metadata-based)
+            cluster_dim = hierarchical_clustering_info.cluster_embeddings.shape[1] if hierarchical_clustering_info.cluster_embeddings is not None else self.item_embedding_dim
+            cluster_input_adapter = ClusterInputAdapter(
+                cluster_embedding_dim=cluster_dim,
+                model_dims=self.model_dims,
+                hidden_dim=self.model_dims // 2,
+                num_layers=2,
+                name='cluster_input_adapter'
+            )
+
+            hierarchical_softmax = HierarchicalSoftmax(
                 num_items=self.num_items,
                 num_clusters=self.num_clusters,
-                item_embedding_dim=self.item_embedding_dim,
-                cluster_assignments=jax_clustering.cluster_assignments,
-                cluster_indices=jax_clustering.cluster_indices,
+                item_embedding_dim=self.model_dims,  # Use model dims (2048)
+                clustering_info=hierarchical_clustering_info,
+                use_item_input_dnn_everywhere=True,
+                item_input_adapter=item_input_adapter,
+                cluster_input_adapter=cluster_input_adapter,
             )
 
             logits, metrics = hierarchical_softmax(
-                hidden_states=item_space_hidden,
-                item_embeddings=item_embedding_table,
+                hidden_states=model_outputs,  # Use Gemma outputs directly (2048-dim)
+                item_embeddings=item_embedding_table,  # Raw 384-dim embeddings
                 targets=targets,
                 loss_mask=weights,
-                training=True,
+                training=training,
             )
         else:
             logits = jnp.zeros((batch_size, seq_len, self.num_items))
