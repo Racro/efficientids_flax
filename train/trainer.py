@@ -114,6 +114,7 @@ class Trainer:
         rng: jax.Array,
         sample_input: Dict[str, jnp.ndarray],
         pretrained_params: Optional[Dict[str, Any]] = None,
+        freeze_transformer: bool = False,
     ) -> TrainState:
         """
         Initialize training state.
@@ -122,6 +123,7 @@ class Trainer:
             rng: Random key
             sample_input: Sample input batch for initialization
             pretrained_params: Optional pretrained parameters to load
+            freeze_transformer: If True, only optimize adapters + item embeddings (saves memory!)
 
         Returns:
             TrainState with initialized parameters and optimizer state
@@ -134,11 +136,34 @@ class Trainer:
         if pretrained_params is not None:
             params = self._merge_pretrained_params(params, pretrained_params)
 
+        # If freezing transformer, create optimizer that only tracks trainable params
+        if freeze_transformer:
+            print("🔒 Freezing transformer - optimizer will only track adapters + item embeddings")
+            # Create partition: False = frozen (no optimizer state), True = trainable
+            partition = jax.tree.map(
+                lambda path: 'gemma_transformer' not in '/'.join(str(p) for p in path),
+                params,
+                is_leaf=lambda x: False  # Don't treat any node as leaf
+            )
+            # For now, use simple approach: just exclude 'gemma_transformer' from updates
+            # Full implementation would use optax.masked
+            import optax
+            tx = optax.multi_transform(
+                {
+                    'trainable': self.optimizer,
+                    'frozen': optax.set_to_zero(),  # No updates for frozen params
+                },
+                lambda path, _: 'trainable' if 'gemma_transformer' not in '/'.join(str(p) for p in path) else 'frozen'
+            )
+            optimizer = tx
+        else:
+            optimizer = self.optimizer
+
         # Create train state with gradient accumulation counter
         state = TrainState.create(
             apply_fn=self.model.apply,
             params=params,
-            tx=self.optimizer,
+            tx=optimizer,
             grad_accum_count=0,
         )
 
@@ -182,7 +207,7 @@ class Trainer:
             """Compute loss and auxiliary outputs."""
             # Apply mixed precision if enabled (safe on GPU/TPU/CPU)
             if self.use_mixed_precision:
-                batch_compute = jax.tree_map(
+                batch_compute = jax.tree.map(
                     lambda x: x.astype(jnp.bfloat16) if jnp.issubdtype(x.dtype, jnp.floating) else x,
                     batch
                 )
@@ -212,7 +237,7 @@ class Trainer:
 
             # Convert aux to float32
             if self.use_mixed_precision:
-                aux = jax.tree_map(
+                aux = jax.tree.map(
                     lambda x: x.astype(jnp.float32) if hasattr(x, 'astype') and jnp.issubdtype(x.dtype, jnp.floating) else x,
                     aux
                 )
@@ -231,7 +256,7 @@ class Trainer:
         # Gradient accumulation
         if self.gradient_accumulation_steps > 1:
             # Scale gradients by accumulation steps
-            grads = jax.tree_map(lambda g: g / self.gradient_accumulation_steps, grads)
+            grads = jax.tree.map(lambda g: g / self.gradient_accumulation_steps, grads)
 
             # TODO: Accumulate gradients in state (requires custom TrainState)
             # For now, just apply scaled gradients each step

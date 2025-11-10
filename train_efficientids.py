@@ -33,6 +33,7 @@ from configs.config import (
     get_llama_config,
     get_gemma_config,
     get_debug_config,
+    get_tpu_optimized_config,
     EfficientIDSConfig,
 )
 from data.dataset import create_dataloaders, ClusteringInfo
@@ -217,6 +218,14 @@ def main(args):
             batch_size=args.batch_size,
             max_steps=args.max_steps,
         )
+    elif args.config == 'tpu_optimized':
+        config = get_tpu_optimized_config(
+            num_items=args.num_items,
+            num_clusters=args.num_clusters,
+            item_embedding_dim=args.item_embedding_dim,
+            max_seq_len=args.max_seq_len,
+            max_steps=args.max_steps,
+        )
     elif args.config == 'gemma':
         config = get_gemma_config(
             num_items=args.num_items,
@@ -271,13 +280,18 @@ def main(args):
     logger.info("Creating model...")
     logger.info("=" * 80)
 
-    # Check if using pretrained model
+    # Check if using pretrained model (from config or args)
     gemma_params = None
-    if args.use_pretrained == 'gemma':
+    use_pretrained = args.use_pretrained == 'gemma' or config.model.pretrained_lm_name is not None
+
+    if use_pretrained:
+        logger.info(f"Using pretrained model: {config.model.pretrained_lm_name or 'gemma from args'}")
+        freeze = args.freeze_pretrained or config.model.freeze_lm
         model, gemma_params = create_gemma_model(
-            config, clustering_info, args.pretrained_path, args.freeze_pretrained
+            config, clustering_info, args.pretrained_path, freeze
         )
     else:
+        logger.info("Training from scratch (SimpleEfficientIDSModel)")
         model = create_model_from_config(config, clustering_info)
 
     # ==================== 4. CREATE OPTIMIZER ====================
@@ -299,9 +313,12 @@ def main(args):
         log_every=config.training.log_every,
         eval_every=config.training.eval_every,
         save_every=config.training.save_every,
+        use_remat=config.training.use_remat,
+        use_mixed_precision=config.training.use_mixed_precision,
+        gradient_accumulation_steps=config.training.gradient_accumulation_steps,
     )
 
-    logger.info("Trainer created")
+    logger.info("Trainer created with memory optimizations")
 
     # ==================== 6. INITIALIZE TRAINING STATE ====================
     logger.info("\n" + "=" * 80)
@@ -315,7 +332,15 @@ def main(args):
     sample_batch = next(iter(train_dataset))
 
     # Initialize state (with optional pretrained params)
-    state = trainer.create_train_state(rng, sample_batch, pretrained_params=gemma_params)
+    freeze = use_pretrained and (args.freeze_pretrained or config.model.freeze_lm)
+    state = trainer.create_train_state(
+        rng, sample_batch,
+        pretrained_params=gemma_params,
+        freeze_transformer=freeze
+    )
+
+    if freeze:
+        logger.info("🔒 Transformer frozen - only training adapters + item embeddings")
 
     # Count parameters
     num_params = sum(x.size for x in jax.tree_util.tree_leaves(state.params))
@@ -331,12 +356,14 @@ def main(args):
     logger.info("=" * 80)
 
     # Train
-    state = trainer.train(
+    state, train_metrics = trainer.train(
         state=state,
         train_dataset=iter(train_dataset),
         eval_dataset=iter(val_dataset),
         num_steps=config.training.max_steps,
     )
+
+    logger.info(f"\nTraining metrics: {train_metrics}")
 
     # ==================== 8. FINAL EVALUATION ====================
     logger.info("\n" + "=" * 80)
@@ -399,7 +426,7 @@ if __name__ == "__main__":
         '--config',
         type=str,
         default='qwen',
-        choices=['qwen', 'llama', 'debug', 'gemma'],
+        choices=['qwen', 'llama', 'debug', 'gemma', 'tpu_optimized'],
         help='Preset configuration to use'
     )
 
@@ -427,6 +454,7 @@ if __name__ == "__main__":
     parser.add_argument('--data_dir', type=str, default=None, help='Data directory')
     parser.add_argument('--num_items', type=int, default=3261, help='Number of items')
     parser.add_argument('--num_clusters', type=int, default=100, help='Number of clusters')
+    parser.add_argument('--item_embedding_dim', type=int, default=384, help='Item embedding dimension')
 
     # Training args
     parser.add_argument('--max_steps', type=int, default=None, help='Max training steps')

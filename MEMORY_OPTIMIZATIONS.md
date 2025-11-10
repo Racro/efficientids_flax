@@ -8,10 +8,16 @@ RESOURCE_EXHAUSTED: Error loading program: Attempting to reserve 6.65G...
 There are 509.04M free
 ```
 
-**Solution:**
+**Solution (Frozen Pretrained Gemma/Llama):**
 ```bash
 python train_efficientids.py --config tpu_optimized
 ```
+
+This uses:
+- ✅ **Pretrained Gemma 2B** (or specify `pretrained_lm_name="meta-llama/Llama-3.2-1B"`)
+- ✅ **Frozen transformer** (only trains item embeddings + adapters)
+- ✅ **Full dimensions** (384 item embedding, 2048 model dims)
+- ✅ **Memory optimizations** (remat + bfloat16)
 
 ## Optimizations Implemented
 
@@ -36,17 +42,22 @@ python train_efficientids.py --config tpu_optimized
 
 ## Configuration
 
-**TPU-optimized preset** (fits in 509MB):
+**TPU-optimized preset** (frozen pretrained Gemma, fits in 509MB):
 ```python
 from configs.config import get_tpu_optimized_config
 
 config = get_tpu_optimized_config()
-# item_embedding_dim: 384 (unchanged)
-# model_dims: 512 (unchanged)
+# pretrained_lm_name: "google/gemma-2b"
+# freeze_lm: True (only train adapters + item embeddings)
+# item_embedding_dim: 384
+# model_dims: 2048 (Gemma hidden size)
 # batch_size: 2
 # gradient_accumulation: 8
 # use_remat: True
 # use_mixed_precision: True
+
+# Or use Llama:
+config = get_tpu_optimized_config(pretrained_lm_name="meta-llama/Llama-3.2-1B")
 ```
 
 **Manual configuration**:

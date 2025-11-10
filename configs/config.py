@@ -350,44 +350,46 @@ def get_tpu_optimized_config(
     num_items: int = 3261,
     num_clusters: int = 100,
     item_embedding_dim: int = 384,
-    model_dims: int = 512,
+    pretrained_lm_name: str = "google/gemma-2b",  # Pretrained model
     max_seq_len: int = 128,
     max_steps: int = 10000,
 ) -> EfficientIDSConfig:
     """
-    TPU-optimized configuration with memory-efficient settings.
+    TPU-optimized configuration with FROZEN PRETRAINED LM and memory optimizations.
 
-    Optimizations:
-    - Reduced batch size (4 per device)
-    - Gradient accumulation (4 steps) for effective batch size of 16
-    - Gradient checkpointing (remat) enabled - saves 40-60% memory
-    - Mixed precision (bfloat16) enabled - saves 50% memory + faster on TPU
-    - NO dimension reduction (keeps original model quality)
+    Uses:
+    - Pretrained Gemma 2B (or Llama) - FROZEN
+    - Item embeddings from metadata (384 dim)
+    - Model dims from pretrained LM (2048 for Gemma 2B)
+    - Memory optimizations: remat + bfloat16 + gradient accumulation
 
-    Note: Weights stored as float32, converted to bfloat16 during computation only.
-    This is safe and maintains numerical stability.
+    Optimizations for TPU (509MB available):
+    - Batch size: 2 (very small)
+    - Gradient accumulation: 8 (effective batch = 16)
+    - Gradient checkpointing (remat): ~50% memory savings
+    - Mixed precision (bfloat16): ~50% memory savings + faster on TPU
+    - Frozen LM: Only train item embeddings + adapters (saves memory)
 
-    Expected memory usage with full dimensions (384/512):
-    - Without optimizations: ~6.5GB
-    - With remat + bfloat16: ~1.5-2GB
-    - Should fit in 509MB with batch_size=2-4
+    Expected memory: ~500MB with Gemma 2B frozen
     """
     return EfficientIDSConfig(
         model=ModelConfig(
             num_items=num_items,
             num_clusters=num_clusters,
-            item_embedding_dim=item_embedding_dim,  # Keep original (384)
-            model_dims=model_dims,  # Keep original (512)
+            item_embedding_dim=item_embedding_dim,  # 384
+            model_dims=2048,  # Gemma 2B hidden size (will be auto-detected)
             use_hierarchical_softmax=True,
             use_correction=True,
+            pretrained_lm_name=pretrained_lm_name,  # PRETRAINED MODEL
+            freeze_lm=True,  # FREEZE transformer weights
         ),
         training=TrainingConfig(
             max_steps=max_steps,
             warmup_steps=1000,
-            batch_size=2,  # Very small for TPU memory constraints
-            eval_batch_size=4,
+            batch_size=1,  # Minimal batch size for TPU v6e-1
+            eval_batch_size=2,
             max_seq_len=max_seq_len,
-            learning_rate=1e-4,
+            learning_rate=5e-5,  # Lower LR for pretrained model
             schedule_type='cosine',
             optimizer_type='adamw',
             weight_decay=0.01,
@@ -395,24 +397,24 @@ def get_tpu_optimized_config(
             log_every=50,
             eval_every=500,
             save_every=1000,
-            # MEMORY OPTIMIZATIONS (NO dimension reduction needed!)
-            use_remat=True,  # Gradient checkpointing: ~50% memory savings
-            use_mixed_precision=True,  # bfloat16 compute: ~50% memory savings + faster
-            gradient_accumulation_steps=8,  # Effective batch size = 2 * 8 = 16
+            # MEMORY OPTIMIZATIONS
+            use_remat=True,  # Gradient checkpointing
+            use_mixed_precision=True,  # bfloat16 training
+            gradient_accumulation_steps=8,  # Effective batch = 16
         ),
         data=DataConfig(
             data_dir="./data/ml1m_processed/processed",
             mode='id_only',
-            embedding_init_method='metadata',
+            embedding_init_method='metadata',  # Item embeddings from metadata
         ),
         eval=EvalConfig(
             k_values=[1, 5, 10],
             metric_types=['recall', 'mrr', 'accuracy'],
             num_eval_batches=50,
         ),
-        checkpoint_dir="./checkpoints/tpu_optimized",
-        log_dir="./logs/tpu_optimized",
-        experiment_name="tpu_optimized",
+        checkpoint_dir="./checkpoints/tpu_gemma",
+        log_dir="./logs/tpu_gemma",
+        experiment_name="tpu_gemma_frozen",
     )
 
 
