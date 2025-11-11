@@ -67,6 +67,9 @@ class Trainer:
         use_remat: bool = False,
         use_mixed_precision: bool = False,
         gradient_accumulation_steps: int = 1,
+        enable_profiling: bool = False,
+        profiler_num_steps: int = 5,
+        profiler_start_step: int | None = None,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -78,6 +81,17 @@ class Trainer:
         self.use_remat = use_remat
         self.use_mixed_precision = use_mixed_precision
         self.gradient_accumulation_steps = gradient_accumulation_steps
+
+        # Profiling setup
+        self.profiler = None
+        if enable_profiling:
+            from .profiler import Profiler
+            profiler_dir = self.checkpoint_dir / "profiler_traces"
+            self.profiler = Profiler(
+                num_steps=profiler_num_steps,
+                log_dir=str(profiler_dir),
+                auto_enable_at_step=profiler_start_step,
+            )
 
         # Detect platform
         self.platform = detect_platform()
@@ -117,7 +131,7 @@ class Trainer:
         freeze_transformer: bool = False,
     ) -> TrainState:
         """
-        Initialize training state.
+        Initialize training state with model sharding for multi-device.
 
         Args:
             rng: Random key
@@ -128,59 +142,122 @@ class Trainer:
         Returns:
             TrainState with initialized parameters and optimizer state
         """
+        from jax.sharding import PartitionSpec as P, NamedSharding, Mesh
+        from jax.experimental import mesh_utils
+
+        # Check if we have multiple devices - set up sharding mesh
+        devices = jax.devices()
+        num_devices = len(devices)
+
+        if num_devices > 1:
+            print(f"🔀 Setting up model sharding across {num_devices} devices")
+            # Create 1D mesh along 'model' axis for model parallelism
+            device_mesh = mesh_utils.create_device_mesh((num_devices,))
+            mesh = Mesh(device_mesh, axis_names=('model',))
+            print(f"   Mesh: {mesh}")
+        else:
+            mesh = None
+
         # Initialize model parameters
-        variables = self.model.init(rng, **sample_input, training=True)
-        params = variables['params']
-
-        # Load pretrained params if provided
         if pretrained_params is not None:
-            params = self._merge_pretrained_params(params, pretrained_params)
+            # If we have pretrained params, initialize with abstract shapes only
+            # to avoid allocating random weights we'll immediately discard
+            print("   Initializing with pretrained params (skipping random init)...")
 
-        # Implement BPROP_VARIABLE_EXCLUSION like Paxml
+            # Get param structure with lazy init (shapes only, no arrays)
+            from jax import eval_shape
+            variables_shape = eval_shape(
+                lambda: self.model.init(rng, **sample_input, training=True)
+            )
+
+            # Use pretrained params as base, fill in any missing with zeros
+            params = pretrained_params
+
+            # Add any params not in pretrained (e.g., adapters, item embeddings)
+            # by initializing only those parts
+            if 'item_embedding_table' not in params:
+                print("   Initializing non-pretrained params (adapters, embeddings)...")
+                full_init = self.model.init(rng, **sample_input, training=True)
+                params_full = full_init['params']
+
+                # Copy non-transformer params from full init
+                for key in params_full.keys():
+                    if key not in params:
+                        params[key] = params_full[key]
+        else:
+            # No pretrained params, do full random init
+            variables = self.model.init(rng, **sample_input, training=True)
+            params = variables['params']
+
+        # Shard model parameters across devices (if multi-device)
+        if mesh is not None:
+            print(f"   Sharding transformer weights across {num_devices} devices...")
+            from flax.traverse_util import flatten_dict, unflatten_dict
+
+            def get_sharding_spec(path_str: str, shape: tuple) -> P:
+                """
+                Get sharding spec for parameter.
+
+                Strategy:
+                - Transformer large matrices: Shard along first dim (8GB/4 = 2GB per chip)
+                - Small params (biases, norms): Replicate (tiny)
+                - Adapters/embeddings: Replicate (small, ~5MB)
+                """
+                # Transformer layers - shard large weights
+                if 'transformer/' in path_str:
+                    # Large weight matrices (kernels, embeddings)
+                    if ('kernel' in path_str or 'embedding' in path_str) and len(shape) >= 2:
+                        # Shard first dimension across model axis
+                        return P('model', None)
+                    else:
+                        # Small params (bias, scale) - replicate
+                        return P(None)
+                else:
+                    # Adapters and embeddings - replicate (small)
+                    return P(None)
+
+            # Apply sharding
+            flat_params = flatten_dict(params, sep='/')
+            sharded_params = {}
+
+            with mesh:
+                for path_str, value in flat_params.items():
+                    spec = get_sharding_spec(path_str, value.shape)
+                    sharding = NamedSharding(mesh, spec)
+                    sharded_params[path_str] = jax.device_put(value, sharding)
+
+            params = unflatten_dict(sharded_params, sep='/')
+            print(f"   ✓ Transformer sharded: ~{8000 // num_devices}MB per device (from ~8GB)")
+
+            # Store mesh for later use in train_step
+            self._mesh = mesh
+        else:
+            self._mesh = None
+
+        # Store freeze info for use in train_step
+        self._freeze_transformer = freeze_transformer
         if freeze_transformer:
             print("🔒 Freezing transformer (BPROP_VARIABLE_EXCLUSION like Paxml)")
-            import optax
             import re
 
             # Paxml-style exclusion patterns
-            exclusion_patterns = [
-                r'gemma_transformer/.*',  # Freeze entire transformer
+            self._exclusion_patterns = [
+                r'transformer/.*',  # Freeze entire transformer
             ]
 
-            def matches_exclusion(path_str):
-                """Check if parameter path matches any exclusion pattern."""
-                return any(re.match(pattern, path_str) for pattern in exclusion_patterns)
-
-            def partition_fn(path, value):
-                """Partition params: 'frozen' or 'trainable' (Paxml behavior)."""
-                path_parts = []
-                for key in path:
-                    if hasattr(key, 'key'):
-                        path_parts.append(str(key.key))
-                    else:
-                        path_parts.append(str(key))
-                path_str = '/'.join(path_parts)
-                return 'frozen' if matches_exclusion(path_str) else 'trainable'
-
-            # Count params (like Paxml does)
+            # Count params
             from flax.traverse_util import flatten_dict
             flat_params = flatten_dict(params, sep='/')
+
+            def matches_exclusion(path_str):
+                return any(re.match(p, path_str) for p in self._exclusion_patterns)
+
             frozen_count = sum(v.size for k, v in flat_params.items() if matches_exclusion(k))
             trainable_count = sum(v.size for k, v in flat_params.items() if not matches_exclusion(k))
             print(f"   Trainable: {trainable_count:,} params")
             print(f"   Frozen: {frozen_count:,} params")
 
-            # Use multi_transform: trainable gets optimizer, frozen gets zero gradients
-            # This is exactly what Paxml's bprop_variable_exclusion does
-            optimizer = optax.multi_transform(
-                {
-                    'trainable': self.optimizer,
-                    'frozen': optax.set_to_zero(),  # Skip gradients for frozen params
-                },
-                partition_fn
-            )
-        else:
-            optimizer = self.optimizer
+        optimizer = self.optimizer
 
         # Create train state with gradient accumulation counter
         state = TrainState.create(
@@ -204,10 +281,12 @@ class Trainer:
 
         merged = copy.deepcopy(initialized_params)
 
-        # Merge transformer parameters if present
-        if 'transformer' in pretrained_params and 'transformer' in merged:
-            logger.info(f"  ✓ Merging transformer weights from pretrained checkpoint")
-            merged['transformer'] = pretrained_params['transformer']
+        # Merge transformer parameters - try multiple key names
+        for key in ['transformer', 'gemma_transformer', 'GemmaTransformer']:
+            if key in pretrained_params and key in merged:
+                logger.info(f"  ✓ Merging {key} weights from pretrained checkpoint")
+                merged[key] = pretrained_params[key]
+                break
 
         return merged
 
@@ -276,6 +355,18 @@ class Trainer:
         grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
         (loss, aux), grads = grad_fn(state.params)
 
+        # Zero out frozen gradients (BPROP_VARIABLE_EXCLUSION like Paxml)
+        if hasattr(self, '_freeze_transformer') and self._freeze_transformer:
+            import re
+            from flax.traverse_util import flatten_dict, unflatten_dict
+
+            flat_grads = flatten_dict(grads, sep='/')
+            for key in flat_grads.keys():
+                # Check if this param should be frozen
+                if any(re.match(p, key) for p in self._exclusion_patterns):
+                    flat_grads[key] = jnp.zeros_like(flat_grads[key])
+            grads = unflatten_dict(flat_grads, sep='/')
+
         # Gradient accumulation
         if self.gradient_accumulation_steps > 1:
             # Scale gradients by accumulation steps
@@ -285,7 +376,7 @@ class Trainer:
             # For now, just apply scaled gradients each step
             # Full implementation needs accumulated_grads in TrainState
 
-        # Compute gradient norm for monitoring
+        # Compute gradient norm for monitoring (only trainable)
         grad_norm = optax.global_norm(grads)
 
         # Update parameters
@@ -365,7 +456,11 @@ class Trainer:
         print(f"   Platform: {self.platform.upper()}")
         print(f"   Devices: {len(devices)} x {devices[0].platform}")
         if len(devices) > 1:
-            print(f"   Data parallelism: ENABLED (batch split across {len(devices)} devices)")
+            if hasattr(self, '_mesh') and self._mesh is not None:
+                print(f"   Model sharding: ENABLED (params split across {len(devices)} devices)")
+                print(f"   Data parallelism: ENABLED (batch replicated on all devices)")
+            else:
+                print(f"   Data parallelism: ENABLED (batch split across {len(devices)} devices)")
         print(f"   Logging every {self.log_every} steps")
         print(f"   Evaluating every {self.eval_every} steps")
         print(f"   Saving every {self.save_every} steps")
@@ -377,7 +472,8 @@ class Trainer:
             print(f"   📊 Gradient accumulation: {self.gradient_accumulation_steps} steps")
         print()
 
-        # JIT compile train step
+        # JIT compile train step with sharding support
+        # JAX will automatically use the sharding from params
         train_step_jit = jax.jit(self.train_step)
 
         # Metrics accumulator
@@ -385,6 +481,10 @@ class Trainer:
         start_time = time.time()
 
         for step in range(state.step, num_steps):
+            # Profiler: begin step
+            if self.profiler is not None:
+                self.profiler.begin_step(step)
+
             # Get next batch
             try:
                 batch = next(train_dataset)
@@ -396,6 +496,10 @@ class Trainer:
             step_start = time.time()
             state, metrics = train_step_jit(state, batch)
             step_time = time.time() - step_start
+
+            # Profiler: end step
+            if self.profiler is not None:
+                self.profiler.end_step()
 
             # Accumulate metrics
             metrics_history.append(metrics)

@@ -316,6 +316,9 @@ def main(args):
         use_remat=config.training.use_remat,
         use_mixed_precision=config.training.use_mixed_precision,
         gradient_accumulation_steps=config.training.gradient_accumulation_steps,
+        enable_profiling=args.enable_profiling,
+        profiler_num_steps=args.profiler_num_steps,
+        profiler_start_step=args.profiler_start_step,
     )
 
     logger.info("Trainer created with memory optimizations")
@@ -463,6 +466,11 @@ if __name__ == "__main__":
 
     # Output args
     parser.add_argument('--checkpoint_dir', type=str, default=None, help='Checkpoint directory')
+
+    # Profiling arguments
+    parser.add_argument('--enable_profiling', action='store_true', help='Enable JAX profiler')
+    parser.add_argument('--profiler_num_steps', type=int, default=5, help='Number of steps to profile')
+    parser.add_argument('--profiler_start_step', type=int, default=150, help='Step to start profiling (default: 150 - after warmup)')
 
     args = parser.parse_args()
 
