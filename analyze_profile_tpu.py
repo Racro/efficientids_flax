@@ -515,21 +515,142 @@ class ProfileAnalyzer:
         kernel_stats.sort(key=lambda x: x['total_us'], reverse=True)
         return kernel_stats[:top_n]
 
-    def estimate_gpu_utilization(self, step_stats: Dict) -> Dict[str, float]:
-        """Estimate GPU utilization metrics."""
+    def estimate_timeline_coverage(self, step_stats: Dict, multi_device_stats: Optional[Dict] = None) -> Dict[str, float]:
+        """Calculate timeline coverage metrics.
+
+        IMPORTANT: This measures % of timeline covered by kernels, NOT hardware utilization.
+        For true hardware utilization, use nvidia-smi (GPU) or cloud monitoring (TPU).
+
+        Timeline coverage = % of trace time where at least one kernel is executing.
+        - High (>80%): Dense kernel execution, minimal idle time
+        - Low (<50%): Many gaps, launch overhead, or data loading bottlenecks
+
+        For multi-device systems, uses per-device stats that account for kernel overlaps.
+        """
         if not step_stats or not self.kernel_events:
             return {}
 
         total_kernel_time_us = sum(e.get('dur', 0) for e in self.kernel_events)
         total_trace_time_us = step_stats.get('total_us', 0)
 
-        gpu_util_pct = (total_kernel_time_us / total_trace_time_us * 100) if total_trace_time_us > 0 else 0
+        # Check if we have multi-device stats (more accurate for TPU/multi-GPU)
+        if multi_device_stats and multi_device_stats.get('num_devices', 0) > 1:
+            # Use average timeline coverage from multi-device analysis (accounts for overlaps)
+            device_stats = multi_device_stats.get('device_stats', {})
+            if device_stats:
+                coverages = [stats['timeline_coverage_pct'] for stats in device_stats.values()]
+                avg_coverage = sum(coverages) / len(coverages)
 
-        return {
-            'gpu_compute_util_pct': gpu_util_pct,
-            'kernel_time_us': total_kernel_time_us,
-            'overhead_time_us': total_trace_time_us - total_kernel_time_us,
-        }
+                # Calculate average per-device busy time from device stats
+                avg_busy_time = sum(stats['actual_busy_time_us'] for stats in device_stats.values()) / len(device_stats)
+                avg_device_timeline = sum(stats['total_time_us'] for stats in device_stats.values()) / len(device_stats)
+                avg_idle_time = avg_device_timeline - avg_busy_time
+
+                # Average concurrent kernels across devices
+                concurrent_kernels = [stats['avg_concurrent_kernels'] for stats in device_stats.values()]
+                avg_concurrent = sum(concurrent_kernels) / len(concurrent_kernels)
+
+                return {
+                    'timeline_coverage_pct': avg_coverage,
+                    'kernel_time_us': avg_busy_time,
+                    'idle_time_us': avg_idle_time,
+                    'avg_concurrent_kernels': avg_concurrent,
+                    'num_devices_detected': multi_device_stats['num_devices'],
+                    'total_kernel_time_all_devices_us': total_kernel_time_us,
+                    'calculation_method': 'multi_device_overlap_aware',
+                    '_note': 'Timeline coverage, NOT hardware utilization',
+                }
+
+        # Single device or no multi-device stats: simple calculation
+        num_devices = len([d for d in self.devices.values() if 'TPU' in d or 'GPU' in d])
+        if num_devices == 0:
+            num_devices = 1
+
+        if num_devices == 1:
+            # Single device: calculate with overlap removal for accuracy
+            timestamps = [(e.get('ts', 0), e.get('dur', 0)) for e in self.kernel_events]
+            timestamps = [(ts, dur) for ts, dur in timestamps if ts > 0]
+
+            if timestamps:
+                # Merge overlapping intervals
+                intervals = [(ts, ts + dur) for ts, dur in timestamps]
+                intervals.sort()
+
+                merged = []
+                for start, end in intervals:
+                    if merged and start <= merged[-1][1]:
+                        merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+                    else:
+                        merged.append((start, end))
+
+                actual_busy_time = sum(end - start for start, end in merged)
+                coverage_pct = (actual_busy_time / total_trace_time_us * 100) if total_trace_time_us > 0 else 0
+                idle_time_us = total_trace_time_us - actual_busy_time
+                avg_concurrent = total_kernel_time_us / actual_busy_time if actual_busy_time > 0 else 1.0
+            else:
+                coverage_pct = 0
+                actual_busy_time = 0
+                idle_time_us = total_trace_time_us
+                avg_concurrent = 1.0
+
+            return {
+                'timeline_coverage_pct': coverage_pct,
+                'kernel_time_us': actual_busy_time,
+                'idle_time_us': idle_time_us,
+                'avg_concurrent_kernels': avg_concurrent,
+                'num_devices_detected': num_devices,
+                'calculation_method': 'single_device_overlap_aware',
+                '_note': 'Timeline coverage, NOT hardware utilization',
+            }
+        else:
+            # Multi-device fallback (if multi-device analysis failed)
+            # Do global overlap removal and divide by num_devices
+            timestamps = [(e.get('ts', 0), e.get('dur', 0)) for e in self.kernel_events]
+            timestamps = [(ts, dur) for ts, dur in timestamps if ts > 0]
+
+            if timestamps:
+                # Merge overlapping intervals globally
+                intervals = [(ts, ts + dur) for ts, dur in timestamps]
+                intervals.sort()
+
+                merged = []
+                for start, end in intervals:
+                    if merged and start <= merged[-1][1]:
+                        merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+                    else:
+                        merged.append((start, end))
+
+                # Global busy time (across all devices)
+                # This represents the timeline span where at least one device was busy
+                global_busy_time = sum(end - start for start, end in merged)
+
+                # Timeline coverage: what % of time had any device busy?
+                coverage_pct = (global_busy_time / total_trace_time_us * 100) if total_trace_time_us > 0 else 0
+                idle_time_us = total_trace_time_us - global_busy_time
+
+                # Kernel concurrency: total work / busy time
+                # This captures both intra-device and inter-device parallelism
+                avg_concurrent = total_kernel_time_us / global_busy_time if global_busy_time > 0 else 1.0
+
+                # For reporting: use global_busy_time as kernel_time_us
+                # (This is the actual time with kernels executing, with overlaps removed)
+                kernel_time_us = global_busy_time
+            else:
+                kernel_time_us = 0
+                coverage_pct = 0
+                idle_time_us = total_trace_time_us
+                avg_concurrent = 1.0
+
+            return {
+                'timeline_coverage_pct': coverage_pct,
+                'kernel_time_us': kernel_time_us,
+                'idle_time_us': idle_time_us,
+                'avg_concurrent_kernels': avg_concurrent,
+                'num_devices_detected': num_devices,
+                'total_kernel_time_all_devices_us': total_kernel_time_us,
+                'calculation_method': 'multi_device_global_overlap_removal',
+                '_note': 'Timeline coverage, NOT hardware utilization. Used global overlap removal.',
+            }
 
     def calculate_throughput_metrics(self, step_stats: Dict) -> Dict[str, float]:
         """Calculate throughput in tokens/sec and other metrics."""
@@ -625,11 +746,19 @@ class ProfileAnalyzer:
 
         device_stats = {}
 
+        # Group kernels by device pid
+        kernels_by_pid = defaultdict(list)
+        for event in self.kernel_events:
+            pid = event.get('pid')
+            if pid is not None:
+                kernels_by_pid[pid].append(event)
+
         for pid, device_name in compute_devices.items():
             # Get all kernel events for this device
-            device_kernels = [e for e in self.kernel_events if e.get('pid') == pid]
+            device_kernels = kernels_by_pid.get(pid, [])
 
             if not device_kernels:
+                # Try to match by device name if pid doesn't work
                 continue
 
             total_kernel_time = sum(e.get('dur', 0) for e in device_kernels)
@@ -659,29 +788,46 @@ class ProfileAnalyzer:
 
                 # Actual busy time is sum of merged intervals
                 actual_busy_time = sum(end - start for start, end in merged)
-                actual_util_pct = (actual_busy_time / total_time * 100) if total_time > 0 else 0
+                timeline_coverage_pct = (actual_busy_time / total_time * 100) if total_time > 0 else 0
+
+                # Kernel concurrency: avg number of kernels running simultaneously
+                # If total_kernel_time > actual_busy_time, kernels overlap
+                avg_concurrent_kernels = total_kernel_time / actual_busy_time if actual_busy_time > 0 else 1
 
                 device_stats[device_name] = {
                     'kernel_count': len(device_kernels),
                     'total_kernel_time_us': total_kernel_time,
                     'actual_busy_time_us': actual_busy_time,
                     'total_time_us': total_time,
-                    'utilization_pct': actual_util_pct,
-                    'parallelism': total_kernel_time / actual_busy_time if actual_busy_time > 0 else 1,
+                    'timeline_coverage_pct': timeline_coverage_pct,
+                    'avg_concurrent_kernels': avg_concurrent_kernels,
                 }
 
         # Calculate load imbalance
         if len(device_stats) > 1:
-            utils = [s['utilization_pct'] for s in device_stats.values()]
+            coverages = [s['timeline_coverage_pct'] for s in device_stats.values()]
             kernel_counts = [s['kernel_count'] for s in device_stats.values()]
 
             load_imbalance = {
-                'utilization_stddev': statistics.stdev(utils) if len(utils) > 1 else 0,
-                'utilization_range': max(utils) - min(utils),
+                'coverage_stddev': statistics.stdev(coverages) if len(coverages) > 1 else 0,
+                'coverage_range': max(coverages) - min(coverages),
                 'kernel_count_stddev': statistics.stdev(kernel_counts) if len(kernel_counts) > 1 else 0,
             }
         else:
             load_imbalance = {}
+
+        # If we didn't populate any device_stats (pid matching failed), return partial info
+        if not device_stats:
+            print(f"   ⚠️  Warning: Could not match kernels to devices by PID")
+            print(f"   Devices: {list(compute_devices.values())}")
+            if kernels_by_pid:
+                print(f"   Kernel PIDs: {list(kernels_by_pid.keys())}")
+            return {
+                'num_devices': len(compute_devices),
+                'device_stats': {},
+                'load_imbalance': {},
+                '_warning': 'PID matching failed - using fallback calculation'
+            }
 
         return {
             'num_devices': len(device_stats),
@@ -935,29 +1081,33 @@ class ProfileAnalyzer:
             print(f"\n🖥️  MULTI-DEVICE ANALYSIS ({device_stats['num_devices']} devices):")
             for device_name, stats in device_stats['device_stats'].items():
                 print(f"\n   {device_name}:")
-                print(f"      Utilization: {stats['utilization_pct']:.1f}%")
+                print(f"      Timeline coverage: {stats['timeline_coverage_pct']:.1f}%")
                 print(f"      Kernel count: {stats['kernel_count']}")
                 print(f"      Actual busy time: {stats['actual_busy_time_us']/1000:.2f} ms")
                 print(f"      Total kernel time: {stats['total_kernel_time_us']/1000:.2f} ms")
-                print(f"      Avg parallelism: {stats['parallelism']:.2f}x")
+                print(f"      Avg concurrent kernels: {stats['avg_concurrent_kernels']:.2f}x")
 
             if device_stats.get('load_imbalance'):
                 imbalance = device_stats['load_imbalance']
                 print(f"\n   Load Balance Metrics:")
-                print(f"      Utilization stddev: {imbalance['utilization_stddev']:.2f}%")
-                print(f"      Utilization range: {imbalance['utilization_range']:.2f}%")
+                print(f"      Coverage stddev: {imbalance['coverage_stddev']:.2f}%")
+                print(f"      Coverage range: {imbalance['coverage_range']:.2f}%")
                 print(f"      Kernel count stddev: {imbalance['kernel_count_stddev']:.1f}")
 
-        # GPU Utilization
-        gpu_util = {}
+        # Timeline Coverage (NOT hardware utilization!)
+        timeline_metrics = {}
         if step_stats:
-            gpu_util = self.estimate_gpu_utilization(step_stats)
-            if gpu_util:
+            timeline_metrics = self.estimate_timeline_coverage(step_stats, device_stats)
+            if timeline_metrics:
                 num_steps = step_stats.get('num_steps', 1)
-                print("\n🎯 OVERALL DEVICE UTILIZATION:")
-                print(f"   Compute utilization: {gpu_util['gpu_compute_util_pct']:.1f}%")
-                print(f"   Kernel time: {gpu_util['kernel_time_us']/(1000*num_steps):.2f} ms/step")
-                print(f"   Overhead time: {gpu_util['overhead_time_us']/(1000*num_steps):.2f} ms/step")
+                print("\n🎯 TIMELINE COVERAGE:")
+                print(f"   ⚠️  NOTE: This is timeline coverage, NOT hardware utilization!")
+                print(f"   Timeline coverage: {timeline_metrics['timeline_coverage_pct']:.1f}%")
+                print(f"   Avg concurrent kernels: {timeline_metrics.get('avg_concurrent_kernels', 1.0):.2f}x")
+                print(f"   Kernel time: {timeline_metrics['kernel_time_us']/(1000*num_steps):.2f} ms/step")
+                print(f"   Idle time: {timeline_metrics['idle_time_us']/(1000*num_steps):.2f} ms/step")
+                if 'calculation_method' in timeline_metrics:
+                    print(f"   Method: {timeline_metrics['calculation_method']}")
 
         # Timeline gaps
         gap_stats = self.analyze_timeline_gaps()
@@ -1086,8 +1236,8 @@ class ProfileAnalyzer:
 
         if device_stats and device_stats.get('load_imbalance'):
             imbalance = device_stats['load_imbalance']
-            if imbalance.get('utilization_stddev', 0) > 5:
-                print(f"   ⚠️  Load imbalance detected (stddev {imbalance['utilization_stddev']:.1f}%):")
+            if imbalance.get('coverage_stddev', 0) > 5:
+                print(f"   ⚠️  Load imbalance detected (coverage stddev {imbalance['coverage_stddev']:.1f}%):")
                 print("      - Check if data is evenly distributed across devices")
                 print("      - Verify model parallelism configuration")
                 has_recommendations = True
@@ -1098,11 +1248,12 @@ class ProfileAnalyzer:
             print("      - Consider using async execution or better pipelining")
             has_recommendations = True
 
-        if gpu_util and gpu_util.get('gpu_compute_util_pct', 100) < 50:
-            print(f"   • Low device utilization ({gpu_util['gpu_compute_util_pct']:.1f}%) - consider:")
+        if timeline_metrics and timeline_metrics.get('timeline_coverage_pct', 100) < 50:
+            print(f"   • Low timeline coverage ({timeline_metrics['timeline_coverage_pct']:.1f}%) - consider:")
             print(f"     - Increasing batch size")
-            print(f"     - Reducing framework overhead")
+            print(f"     - Reducing kernel launch overhead")
             print(f"     - Checking for data loading bottlenecks")
+            print(f"     - Note: This measures idle time, not hardware utilization")
             has_recommendations = True
 
         if perf_stats and perf_stats.get('high_variance_kernels'):
@@ -1124,11 +1275,11 @@ class ProfileAnalyzer:
         # Collect all metrics
         step_stats = self.analyze_step_times()
         throughput = self.calculate_throughput_metrics(step_stats) if step_stats else {}
-        gpu_util = self.estimate_gpu_utilization(step_stats) if step_stats else {}
+        multi_device = self.analyze_multi_device()
+        timeline_metrics = self.estimate_timeline_coverage(step_stats, multi_device) if step_stats else {}
         top_kernels = self.analyze_top_kernels(top_n=20)
         kernels_by_op = self.analyze_kernels_by_operation()
         mem_ops = self.analyze_memory_ops()
-        multi_device = self.analyze_multi_device()
         timeline_gaps = self.analyze_timeline_gaps()
         compilation = self.analyze_compilation()
         xla_ops = self.analyze_xla_ops()
@@ -1178,22 +1329,23 @@ class ProfileAnalyzer:
                     "total_kernel_time_us": stats['total_kernel_time_us'],
                     "actual_busy_time_us": stats['actual_busy_time_us'],
                     "total_time_us": stats['total_time_us'],
-                    "utilization_percent": stats['utilization_pct'],
-                    "parallelism": stats['parallelism'],
+                    "timeline_coverage_percent": stats['timeline_coverage_pct'],
+                    "avg_concurrent_kernels": stats['avg_concurrent_kernels'],
                 })
 
             multi_device_unified = {
                 "num_devices": multi_device['num_devices'],
                 "device_stats": device_stats_list,
-                "utilization_stddev": multi_device.get('load_imbalance', {}).get('utilization_stddev'),
-                "utilization_range": multi_device.get('load_imbalance', {}).get('utilization_range'),
+                "coverage_stddev": multi_device.get('load_imbalance', {}).get('coverage_stddev'),
+                "coverage_range": multi_device.get('load_imbalance', {}).get('coverage_range'),
                 "kernel_count_stddev": multi_device.get('load_imbalance', {}).get('kernel_count_stddev'),
+                "_note": "Timeline coverage per device, NOT hardware utilization",
             }
 
-            # Calculate average utilization
+            # Calculate average coverage
             if device_stats_list:
-                avg_util = sum(d['utilization_percent'] for d in device_stats_list) / len(device_stats_list)
-                multi_device_unified["avg_utilization_percent"] = avg_util
+                avg_coverage = sum(d['timeline_coverage_percent'] for d in device_stats_list) / len(device_stats_list)
+                multi_device_unified["avg_timeline_coverage_percent"] = avg_coverage
 
         # Prepare timeline gaps in unified format
         timeline_unified = None
@@ -1278,10 +1430,11 @@ class ProfileAnalyzer:
             ms_per_step=throughput.get('ms_per_step', 0.0),
             tokens_per_batch=throughput.get('tokens_per_batch', 0),
 
-            # Compute Utilization
-            compute_util_percent=gpu_util.get('gpu_compute_util_pct', 0.0),
-            kernel_time_us=gpu_util.get('kernel_time_us', 0.0),
-            overhead_time_us=gpu_util.get('overhead_time_us', 0.0),
+            # Timeline Coverage (per-device average for multi-device)
+            timeline_coverage_percent=timeline_metrics.get('timeline_coverage_pct', 0.0),
+            kernel_time_us=timeline_metrics.get('kernel_time_us', 0.0),
+            idle_time_us=timeline_metrics.get('idle_time_us', 0.0),
+            avg_concurrent_kernels=timeline_metrics.get('avg_concurrent_kernels', 1.0),
 
             # Kernels
             top_kernels=top_kernels,

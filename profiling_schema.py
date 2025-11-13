@@ -65,10 +65,13 @@ def create_unified_result(
     ms_per_step: float = 0.0,
     tokens_per_batch: int = 0,
 
-    # Compute Utilization
-    compute_util_percent: float = 0.0,
-    kernel_time_us: float = 0.0,
-    overhead_time_us: float = 0.0,
+    # Timeline Coverage (NOT hardware utilization!)
+    # This measures % of time with kernels executing, not how efficiently hardware is used
+    # For true HW utilization, use nvidia-smi (GPU) or cloud monitoring (TPU)
+    timeline_coverage_percent: float = 0.0,  # % of timeline covered by kernels
+    kernel_time_us: float = 0.0,  # Time with kernels executing (after overlap removal)
+    idle_time_us: float = 0.0,  # Time with no kernels (gaps)
+    avg_concurrent_kernels: float = 1.0,  # Average number of kernels executing simultaneously
 
     # Kernels
     top_kernels: Optional[List[Dict[str, Any]]] = None,
@@ -145,10 +148,12 @@ def create_unified_result(
             "ms_per_step": ms_per_step,
             "tokens_per_batch": tokens_per_batch,
         },
-        "compute_utilization": {
-            "compute_util_percent": compute_util_percent,
+        "timeline_coverage": {
+            "_note": "Timeline coverage, NOT hardware utilization. Use nvidia-smi/cloud monitoring for HW metrics.",
+            "timeline_coverage_percent": timeline_coverage_percent,
             "kernel_time_us": kernel_time_us,
-            "overhead_time_us": overhead_time_us,
+            "idle_time_us": idle_time_us,
+            "avg_concurrent_kernels": avg_concurrent_kernels,
         },
         "kernels": {
             "top_kernels": top_kernels or [],
@@ -213,7 +218,7 @@ def print_profiling_summary(result: Dict[str, Any]):
     params = result.get("parameter_counts", {})
     step_timing = result.get("step_timing", {})
     throughput = result.get("throughput", {})
-    compute = result.get("compute_utilization", {})
+    timeline = result.get("timeline_coverage", {})
     multi_device = result.get("multi_device")
 
     print("\n" + "="*100)
@@ -247,16 +252,18 @@ def print_profiling_summary(result: Dict[str, Any]):
     print(f"   {throughput.get('samples_per_sec', 0):.1f} samples/sec")
     print(f"   {throughput.get('steps_per_sec', 0):.2f} steps/sec")
 
-    print(f"\n💻 Compute Utilization:")
-    print(f"   {compute.get('compute_util_percent', 0):.1f}% ({metadata.get('platform', '?')})")
-    print(f"   Kernel time: {compute.get('kernel_time_us', 0)/1000:.2f} ms")
-    print(f"   Overhead: {compute.get('overhead_time_us', 0)/1000:.2f} ms")
+    print(f"\n⏱️  Timeline Coverage:")
+    print(f"   ⚠️  NOTE: Timeline coverage, NOT hardware utilization!")
+    print(f"   Coverage: {timeline.get('timeline_coverage_percent', 0):.1f}%")
+    print(f"   Avg concurrent kernels: {timeline.get('avg_concurrent_kernels', 1.0):.2f}x")
+    print(f"   Kernel time: {timeline.get('kernel_time_us', 0)/1000:.2f} ms")
+    print(f"   Idle time: {timeline.get('idle_time_us', 0)/1000:.2f} ms")
 
     if multi_device and multi_device.get('num_devices', 0) > 1:
         print(f"\n🖥️  Multi-Device ({multi_device['num_devices']} devices):")
-        print(f"   Avg utilization: {multi_device.get('avg_utilization_percent', 0):.1f}%")
-        if multi_device.get('load_imbalance', {}).get('utilization_stddev'):
-            print(f"   Load imbalance (stddev): {multi_device['load_imbalance']['utilization_stddev']:.1f}%")
+        print(f"   Avg coverage: {multi_device.get('avg_timeline_coverage_percent', 0):.1f}%")
+        if multi_device.get('coverage_stddev'):
+            print(f"   Load imbalance (stddev): {multi_device['coverage_stddev']:.1f}%")
 
     print("\n" + "="*100)
 
