@@ -14,6 +14,8 @@ Analyzes TPU profiling traces collected from training runs to provide insights i
 - Bottleneck identification and recommendations
 
 TPU-specific features:
+- Automatic step detection from jit_train_step events
+- Automatic incomplete step detection and exclusion
 - TPU System::Execute event detection
 - Multi-core TPU profiling support (v2, v3, v4, v5, v6)
 - Automatic TPU device count and utilization tracking
@@ -23,17 +25,14 @@ TPU-specific features:
 - Performance variance and outlier detection
 
 Usage:
-    # Basic analysis
-    python analyze_profile_tpu.py --trace_file checkpoints/tpu_gemma/profiler_traces/plugins/profile/2025_11_11_09_06_52/t1v-n-bf49aeb0-w-0.trace.json.gz
+    # Basic analysis (auto-detects steps and model config)
+    python analyze_profile_tpu.py --trace_file t1v-n-bf49aeb0-w-0.trace.json.gz
 
-    # With explicit step count (recommended)
-    python analyze_profile_tpu.py --trace_file <path> --num_steps 2
-
-    # Specify checkpoint directory
+    # Specify checkpoint directory for model config
     python analyze_profile_tpu.py --trace_file <path> --checkpoint_dir checkpoints/tpu_gemma
 
     # Export to JSON for GPU/TPU comparison
-    python analyze_profile_tpu.py --trace_file <path> --num_steps 5 --output_json tpu_profile.json
+    python analyze_profile_tpu.py --trace_file <path> --output_json tpu_profile.json
 """
 
 import json
@@ -428,43 +427,138 @@ class ProfileAnalyzer:
 
         return 'Other'
 
+    def _detect_training_steps(self) -> List[Dict]:
+        """Detect actual jit_train_step events and their timing.
+
+        Returns list of step info dicts with start_us, end_us, duration_us.
+        """
+        # Find TPU devices
+        tpu_pids = [pid for pid, name in self.devices.items() if 'TPU:' in name]
+        if not tpu_pids:
+            return []
+
+        # Find all jit_train_step events
+        all_steps = []
+        for pid in tpu_pids:
+            steps = [e for e in self.kernel_events
+                    if 'jit_train_step' in e.get('name', '') and e.get('pid') == pid]
+            all_steps.extend([(pid, e) for e in steps])
+
+        if not all_steps:
+            return []
+
+        # Group by step (all devices execute simultaneously)
+        all_steps.sort(key=lambda x: x[1]['ts'])
+        step_groups = []
+        current_group = []
+        last_ts = 0
+
+        for pid, e in all_steps:
+            if current_group and (e['ts'] - last_ts) > 10000:  # >10ms = new step
+                step_groups.append(current_group)
+                current_group = []
+            current_group.append((pid, e))
+            last_ts = e['ts']
+
+        if current_group:
+            step_groups.append(current_group)
+
+        # Calculate duration for each step
+        step_info = []
+        for step_num, group in enumerate(step_groups):
+            min_start = min(e['ts'] for pid, e in group)
+            max_end = max(e['ts'] + e['dur'] for pid, e in group)
+            duration = max_end - min_start
+
+            step_info.append({
+                'step_num': step_num + 1,
+                'start_us': min_start,
+                'end_us': max_end,
+                'duration_us': duration,
+                'num_devices': len(group)
+            })
+
+        return step_info
+
     def analyze_step_times(self) -> Dict[str, Any]:
         """Analyze step timing from kernel patterns."""
         if not self.kernel_events:
             return {}
 
-        kernel_timestamps = [(e.get('ts', 0), e.get('dur', 0)) for e in self.kernel_events]
-        kernel_timestamps = [(ts, dur) for ts, dur in kernel_timestamps if ts > 0]
-        kernel_timestamps.sort()
+        # FIXED: Use max end time instead of last event by timestamp
+        timestamps = [(e.get('ts', 0), e.get('dur', 0)) for e in self.kernel_events]
+        timestamps = [(ts, dur) for ts, dur in timestamps if ts > 0]
 
-        first_ts = kernel_timestamps[0][0]
-        last_ts, last_dur = kernel_timestamps[-1]
-        total_time_us = (last_ts + last_dur) - first_ts
+        first_ts = min(ts for ts, dur in timestamps)
+        last_end_ts = max(ts + dur for ts, dur in timestamps)
+        total_time_us = last_end_ts - first_ts
 
         total_kernels = len(self.kernel_events)
 
-        # Determine step count
-        if self.num_steps_override is not None:
-            estimated_steps = self.num_steps_override
-            step_source = "command-line"
-        elif hasattr(self, 'detected_step_count') and self.detected_step_count is not None:
-            estimated_steps = self.detected_step_count
-            step_source = "trace"
+        # Detect actual training steps from trace
+        detected_steps = self._detect_training_steps()
+
+        # Determine step count and handle incomplete steps
+        if detected_steps:
+            num_steps = len(detected_steps)
+
+            # Check if last step is incomplete (significantly shorter than others)
+            if num_steps >= 2:
+                durations = [s['duration_us'] for s in detected_steps]
+                last_duration = durations[-1]
+                avg_earlier = sum(durations[:-1]) / len(durations[:-1])
+
+                # If last step is <80% of average, it's incomplete
+                if last_duration < 0.8 * avg_earlier:
+                    print(f"   ⚠️  Last step is incomplete ({last_duration/1000:.2f}ms vs {avg_earlier/1000:.2f}ms avg)")
+                    print(f"   Using first {num_steps-1} complete steps only")
+
+                    complete_steps = detected_steps[:-1]
+                    num_complete = len(complete_steps)
+
+                    # Calculate time from first to last COMPLETE step
+                    total_time_us = complete_steps[-1]['end_us'] - complete_steps[0]['start_us']
+                    avg_step_time_us = total_time_us / num_complete
+
+                    return {
+                        'num_steps': num_complete,
+                        'total_steps_in_trace': num_steps,
+                        'incomplete_steps': 1,
+                        'total_us': total_time_us,
+                        'avg_us': avg_step_time_us,
+                        'total_kernels': total_kernels,
+                        'kernels_per_step': total_kernels // num_complete if num_complete > 0 else 0,
+                        'step_source': 'trace-detected-complete-only',
+                    }
+
+            # All steps are complete
+            avg_step_time_us = total_time_us / num_steps
+
+            return {
+                'num_steps': num_steps,
+                'total_us': total_time_us,
+                'avg_us': avg_step_time_us,
+                'total_kernels': total_kernels,
+                'kernels_per_step': total_kernels // num_steps if num_steps > 0 else 0,
+                'step_source': 'trace-detected',
+            }
         else:
+            # No jit_train_step events found - fallback to heuristic
+            print(f"   ⚠️  Warning: No jit_train_step events detected in trace")
+            print(f"   Falling back to heuristic estimation")
+
             # Heuristic: ~200-300 kernels per step for transformer models
             estimated_steps = max(1, total_kernels // 250)
-            step_source = "heuristic"
+            avg_step_time_us = total_time_us / estimated_steps
 
-        avg_step_time_us = total_time_us / estimated_steps
-
-        return {
-            'num_steps': estimated_steps,
-            'total_us': total_time_us,
-            'avg_us': avg_step_time_us,
-            'total_kernels': total_kernels,
-            'kernels_per_step': total_kernels // estimated_steps if estimated_steps > 0 else 0,
-            'step_source': step_source,
-        }
+            return {
+                'num_steps': estimated_steps,
+                'total_us': total_time_us,
+                'avg_us': avg_step_time_us,
+                'total_kernels': total_kernels,
+                'kernels_per_step': total_kernels // estimated_steps if estimated_steps > 0 else 0,
+                'step_source': 'heuristic',
+            }
 
     def analyze_kernels_by_operation(self) -> Dict[str, Any]:
         """Analyze kernels grouped by operation type."""
@@ -667,12 +761,22 @@ class ProfileAnalyzer:
             tokens_per_sec = 0
             samples_per_sec = 0
 
+        # Calculate per-device metrics
+        num_devices = len([d for d in self.devices.values() if 'TPU' in d or 'GPU' in d])
+        if num_devices == 0:
+            num_devices = 1
+
+        tokens_per_sec_per_device = tokens_per_sec / num_devices if num_devices > 0 else 0
+        samples_per_sec_per_device = samples_per_sec / num_devices if num_devices > 0 else 0
+
         return {
             'tokens_per_sec': tokens_per_sec,
             'samples_per_sec': samples_per_sec,
             'tokens_per_batch': tokens_per_batch,
             'ms_per_step': avg_step_ms,
             'steps_per_sec': 1000 / avg_step_ms if avg_step_ms > 0 else 0,
+            'tokens_per_sec_per_device': tokens_per_sec_per_device,
+            'samples_per_sec_per_device': samples_per_sec_per_device,
         }
 
     def analyze_memory_ops(self) -> Dict[str, Any]:
@@ -768,10 +872,10 @@ class ProfileAnalyzer:
             timestamps = [(ts, dur) for ts, dur in timestamps if ts > 0]
 
             if timestamps:
-                timestamps.sort()
-                first_ts = timestamps[0][0]
-                last_ts, last_dur = timestamps[-1]
-                total_time = (last_ts + last_dur) - first_ts
+                # FIXED: Use max end time instead of last event by timestamp
+                first_ts = min(ts for ts, dur in timestamps)
+                last_end_ts = max(ts + dur for ts, dur in timestamps)
+                total_time = last_end_ts - first_ts
 
                 # Calculate actual utilization accounting for overlaps
                 # Sort by start time and merge overlapping intervals
@@ -1057,7 +1161,11 @@ class ProfileAnalyzer:
         if step_stats:
             print("\n⏱️  STEP TIMING & THROUGHPUT:")
             step_source = step_stats.get('step_source', 'unknown')
-            if step_source == 'trace':
+            if step_source == 'trace-detected-complete-only':
+                total_steps = step_stats.get('total_steps_in_trace', step_stats['num_steps'])
+                incomplete = step_stats.get('incomplete_steps', 0)
+                print(f"   ✅ Step count from trace: {step_stats['num_steps']} complete steps ({total_steps} total, {incomplete} incomplete)")
+            elif step_source == 'trace-detected':
                 print(f"   ✅ Step count from trace: {step_stats['num_steps']}")
             elif step_source == 'command-line':
                 print(f"   ✅ Step count from CLI: {step_stats['num_steps']}")
@@ -1070,10 +1178,18 @@ class ProfileAnalyzer:
 
             throughput = self.calculate_throughput_metrics(step_stats)
             if throughput:
+                num_devices = len([d for d in self.devices.values() if 'TPU' in d or 'GPU' in d]) or 1
+
                 print("\n   📈 Throughput:")
-                print(f"      • {throughput['tokens_per_sec']:.1f} tokens/sec")
-                print(f"      • {throughput['samples_per_sec']:.2f} samples/sec")
+                print(f"      • {throughput['tokens_per_sec']:.1f} tokens/sec (system)")
+                print(f"      • {throughput['tokens_per_sec_per_device']:.1f} tokens/sec/device (effective)")
+                print(f"      • {throughput['samples_per_sec']:.2f} samples/sec (system)")
+                print(f"      • {throughput['samples_per_sec_per_device']:.2f} samples/sec/device (effective)")
                 print(f"      • {throughput['steps_per_sec']:.2f} steps/sec")
+
+                if num_devices > 1:
+                    print(f"\n      Note: Per-device metrics assume {num_devices} devices working together")
+                    print(f"            For model-sharded setups, this is effective throughput per device")
 
         # Multi-device analysis
         device_stats = self.analyze_multi_device()
@@ -1429,6 +1545,8 @@ class ProfileAnalyzer:
             steps_per_sec=throughput.get('steps_per_sec', 0.0),
             ms_per_step=throughput.get('ms_per_step', 0.0),
             tokens_per_batch=throughput.get('tokens_per_batch', 0),
+            tokens_per_sec_per_device=throughput.get('tokens_per_sec_per_device'),
+            samples_per_sec_per_device=throughput.get('samples_per_sec_per_device'),
 
             # Timeline Coverage (per-device average for multi-device)
             timeline_coverage_percent=timeline_metrics.get('timeline_coverage_pct', 0.0),
@@ -1459,19 +1577,18 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic analysis
+  # Basic analysis (auto-detects steps from trace)
   python analyze_profile.py --trace_file checkpoints/tpu_gemma/profiler_traces/plugins/profile/*/trace.json.gz
-
-  # With explicit step count
-  python analyze_profile.py --trace_file trace.json.gz --num_steps 2
 
   # Specify checkpoint directory
   python analyze_profile.py --trace_file trace.json.gz --checkpoint_dir checkpoints/tpu_gemma
+
+  # Export to JSON for GPU/TPU comparison
+  python analyze_profile.py --trace_file trace.json.gz --output_json tpu_profile.json
         """
     )
     parser.add_argument('--trace_file', type=str, required=True, help='Path to trace.json.gz')
     parser.add_argument('--checkpoint_dir', type=str, help='Checkpoint directory (auto-detected if not provided)')
-    parser.add_argument('--num_steps', type=int, help='Number of steps captured (overrides auto-detection)')
     parser.add_argument('--output_json', type=str, help='Save results to JSON file (unified format for comparison)')
 
     args = parser.parse_args()
@@ -1480,7 +1597,7 @@ Examples:
         print(f"❌ Error: Trace file not found: {args.trace_file}")
         return 1
 
-    analyzer = ProfileAnalyzer(args.trace_file, args.checkpoint_dir, args.num_steps)
+    analyzer = ProfileAnalyzer(args.trace_file, args.checkpoint_dir, num_steps=None)
 
     # Always print console summary
     analyzer.print_summary()

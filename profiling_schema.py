@@ -64,6 +64,8 @@ def create_unified_result(
     steps_per_sec: float = 0.0,
     ms_per_step: float = 0.0,
     tokens_per_batch: int = 0,
+    tokens_per_sec_per_device: Optional[float] = None,
+    samples_per_sec_per_device: Optional[float] = None,
 
     # Timeline Coverage (NOT hardware utilization!)
     # This measures % of time with kernels executing, not how efficiently hardware is used
@@ -147,6 +149,9 @@ def create_unified_result(
             "steps_per_sec": steps_per_sec,
             "ms_per_step": ms_per_step,
             "tokens_per_batch": tokens_per_batch,
+            "tokens_per_sec_per_device": tokens_per_sec_per_device,
+            "samples_per_sec_per_device": samples_per_sec_per_device,
+            "_note_per_device": "Per-device metrics are effective (total / num_devices), not actual single-device throughput",
         },
         "timeline_coverage": {
             "_note": "Timeline coverage, NOT hardware utilization. Use nvidia-smi/cloud monitoring for HW metrics.",
@@ -248,8 +253,12 @@ def print_profiling_summary(result: Dict[str, Any]):
     print(f"   Kernels/step: {step_timing.get('kernels_per_step', 0):.0f}")
 
     print(f"\n🚀 Throughput:")
-    print(f"   {throughput.get('tokens_per_sec', 0):.0f} tokens/sec")
-    print(f"   {throughput.get('samples_per_sec', 0):.1f} samples/sec")
+    print(f"   {throughput.get('tokens_per_sec', 0):.0f} tokens/sec (system)")
+    if throughput.get('tokens_per_sec_per_device'):
+        print(f"   {throughput.get('tokens_per_sec_per_device', 0):.0f} tokens/sec/device (effective)")
+    print(f"   {throughput.get('samples_per_sec', 0):.1f} samples/sec (system)")
+    if throughput.get('samples_per_sec_per_device'):
+        print(f"   {throughput.get('samples_per_sec_per_device', 0):.1f} samples/sec/device (effective)")
     print(f"   {throughput.get('steps_per_sec', 0):.2f} steps/sec")
 
     print(f"\n⏱️  Timeline Coverage:")
