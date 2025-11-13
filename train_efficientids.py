@@ -21,6 +21,12 @@ import argparse
 import logging
 from pathlib import Path
 import sys
+import os
+import warnings
+
+# Suppress PTX warnings and other XLA noise
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+warnings.filterwarnings('ignore')
 
 import jax
 import jax.numpy as jnp
@@ -476,7 +482,7 @@ if __name__ == "__main__":
 
     # Fill in defaults
     if args.max_steps is None:
-        args.max_steps = 10000 if args.config != 'debug' else 200
+        args.max_steps = 1000 if args.config != 'debug' else 200
     if args.batch_size is None:
         args.batch_size = 16 if args.config != 'debug' else 4
     if args.max_seq_len is None:

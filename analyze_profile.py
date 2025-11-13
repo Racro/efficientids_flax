@@ -1,39 +1,36 @@
 #!/usr/bin/env python3
 """
-TPU-specific JAX profiler trace analyzer for efficientids_flax.
+Comprehensive JAX profiler trace analyzer for efficientids_flax.
 
-Analyzes TPU profiling traces collected from training runs to provide insights into:
+Analyzes profiling traces collected from training runs to provide insights into:
 - Step timing and throughput metrics
-- Multi-device TPU utilization and load balancing
+- Multi-device utilization and load balancing (TPU/GPU)
 - Timeline gap analysis and idle time detection
 - XLA compilation overhead
-- TPU kernel performance by operation type
+- Kernel performance by operation type
 - Memory transfer analysis (H2D, D2H, D2D)
 - I/O and data loading bottlenecks
 - Statistical performance stability (variance analysis)
 - Bottleneck identification and recommendations
 
-TPU-specific features:
-- TPU System::Execute event detection
-- Multi-core TPU profiling support (v2, v3, v4, v5, v6)
-- Automatic TPU device count and utilization tracking
-- Load imbalance detection across TPU cores
-- HLO operation analysis (fusion, collective-permute, etc.)
-- TPU memory transfer tracking
+Features:
+- Multi-device TPU/GPU profiling support
+- Automatic device count and utilization tracking
+- Load imbalance detection across devices
+- Kernel launch gap and idle time analysis
+- XLA operation breakdown
+- Memory transfer bandwidth analysis
 - Performance variance and outlier detection
 
 Usage:
     # Basic analysis
-    python analyze_profile_tpu.py --trace_file checkpoints/tpu_gemma/profiler_traces/plugins/profile/2025_11_11_09_06_52/t1v-n-bf49aeb0-w-0.trace.json.gz
+    python analyze_profile.py --trace_file checkpoints/tpu_gemma/profiler_traces/plugins/profile/2025_11_11_09_06_52/t1v-n-bf49aeb0-w-0.trace.json.gz
 
     # With explicit step count (recommended)
-    python analyze_profile_tpu.py --trace_file <path> --num_steps 2
+    python analyze_profile.py --trace_file <path> --num_steps 2
 
     # Specify checkpoint directory
-    python analyze_profile_tpu.py --trace_file <path> --checkpoint_dir checkpoints/tpu_gemma
-
-    # Export to JSON for GPU/TPU comparison
-    python analyze_profile_tpu.py --trace_file <path> --num_steps 5 --output_json tpu_profile.json
+    python analyze_profile.py --trace_file <path> --checkpoint_dir checkpoints/tpu_gemma
 """
 
 import json
@@ -44,14 +41,6 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Any, Tuple, Optional
 import statistics
-
-# Import unified profiling schema
-try:
-    from profiling_schema import create_unified_result, save_profiling_json, print_profiling_summary
-    HAS_SCHEMA = True
-except ImportError:
-    HAS_SCHEMA = False
-    print("⚠️  Warning: profiling_schema.py not found. JSON export disabled.")
 
 
 class ModelConfig:
@@ -1115,190 +1104,6 @@ class ProfileAnalyzer:
 
         print("="*120)
 
-    def generate_unified_result(self) -> Optional[Dict[str, Any]]:
-        """Generate unified profiling result for JSON export."""
-        if not HAS_SCHEMA:
-            print("❌ Cannot generate JSON: profiling_schema not available")
-            return None
-
-        # Collect all metrics
-        step_stats = self.analyze_step_times()
-        throughput = self.calculate_throughput_metrics(step_stats) if step_stats else {}
-        gpu_util = self.estimate_gpu_utilization(step_stats) if step_stats else {}
-        top_kernels = self.analyze_top_kernels(top_n=20)
-        kernels_by_op = self.analyze_kernels_by_operation()
-        mem_ops = self.analyze_memory_ops()
-        multi_device = self.analyze_multi_device()
-        timeline_gaps = self.analyze_timeline_gaps()
-        compilation = self.analyze_compilation()
-        xla_ops = self.analyze_xla_ops()
-        io_ops = self.analyze_io_operations()
-        perf_stats = self.analyze_statistical_performance()
-
-        # Detect device type from trace
-        device_type = "Unknown"
-        for device_name in self.devices.values():
-            if 'TPU' in device_name:
-                # Extract TPU version if possible
-                if '/device:TPU:' in device_name:
-                    device_type = "TPU (multi-core)"
-                else:
-                    device_type = "TPU"
-                break
-            elif 'GPU' in device_name:
-                device_type = "GPU"
-                break
-
-        # Determine number of TPU/GPU devices
-        num_devices = len([d for d in self.devices.values() if 'TPU' in d or 'GPU' in d])
-
-        # Prepare memory operations in unified format
-        memory_unified = None
-        if mem_ops:
-            transfers = mem_ops.get('transfers', {})
-            memory_unified = {
-                "h2d_count": transfers.get('h2d', {}).get('count', 0),
-                "h2d_total_time_us": transfers.get('h2d', {}).get('total_us', 0.0),
-                "d2h_count": transfers.get('d2h', {}).get('count', 0),
-                "d2h_total_time_us": transfers.get('d2h', {}).get('total_us', 0.0),
-                "d2d_count": transfers.get('d2d', {}).get('count', 0),
-                "d2d_total_time_us": transfers.get('d2d', {}).get('total_us', 0.0),
-                "total_memory_ops": mem_ops.get('num_ops', 0),
-            }
-
-        # Prepare multi-device stats in unified format
-        multi_device_unified = None
-        if multi_device and multi_device.get('num_devices', 0) > 1:
-            device_stats_list = []
-            for idx, (device_name, stats) in enumerate(multi_device.get('device_stats', {}).items()):
-                device_stats_list.append({
-                    "device_name": device_name,
-                    "device_id": idx,
-                    "kernel_count": stats['kernel_count'],
-                    "total_kernel_time_us": stats['total_kernel_time_us'],
-                    "actual_busy_time_us": stats['actual_busy_time_us'],
-                    "total_time_us": stats['total_time_us'],
-                    "utilization_percent": stats['utilization_pct'],
-                    "parallelism": stats['parallelism'],
-                })
-
-            multi_device_unified = {
-                "num_devices": multi_device['num_devices'],
-                "device_stats": device_stats_list,
-                "utilization_stddev": multi_device.get('load_imbalance', {}).get('utilization_stddev'),
-                "utilization_range": multi_device.get('load_imbalance', {}).get('utilization_range'),
-                "kernel_count_stddev": multi_device.get('load_imbalance', {}).get('kernel_count_stddev'),
-            }
-
-            # Calculate average utilization
-            if device_stats_list:
-                avg_util = sum(d['utilization_percent'] for d in device_stats_list) / len(device_stats_list)
-                multi_device_unified["avg_utilization_percent"] = avg_util
-
-        # Prepare timeline gaps in unified format
-        timeline_unified = None
-        if timeline_gaps:
-            timeline_unified = {
-                "total_gaps": timeline_gaps.get('total_gaps', 0),
-                "total_gap_time_us": timeline_gaps.get('total_gap_time_us', 0.0),
-                "avg_gap_us": timeline_gaps.get('avg_gap_us', 0.0),
-                "max_gap_us": timeline_gaps.get('max_gap_us', 0.0),
-                "gap_time_percent": (timeline_gaps.get('total_gap_time_us', 0.0) / step_stats.get('total_us', 1) * 100) if step_stats else 0.0,
-                "gaps_under_10us": timeline_gaps.get('small_gaps', 0),
-                "gaps_10_100us": timeline_gaps.get('medium_gaps', 0),
-                "gaps_100_1000us": 0,  # Not tracked separately
-                "gaps_over_1000us": timeline_gaps.get('large_gaps', 0),
-            }
-
-        # Prepare compilation stats
-        compilation_unified = None
-        if compilation:
-            compilation_unified = {
-                "compilation_time_us": compilation.get('compilation_time_us', 0.0),
-                "num_xla_modules": compilation.get('num_xla_modules', 0),
-                "num_compilation_events": compilation.get('num_compilation_events', 0),
-                "compilation_percent": (compilation.get('compilation_time_us', 0.0) / step_stats.get('total_us', 1) * 100) if step_stats else 0.0,
-            }
-
-        # Prepare I/O operations
-        io_unified = None
-        if io_ops:
-            io_unified = {
-                "io_event_count": io_ops.get('num_io_ops', 0),
-                "io_total_time_us": io_ops.get('total_io_time_us', 0.0),
-                "io_percent": (io_ops.get('total_io_time_us', 0.0) / step_stats.get('total_us', 1) * 100) if step_stats else 0.0,
-            }
-
-        # Prepare statistical performance
-        stats_unified = None
-        if perf_stats:
-            overall = perf_stats.get('overall_kernel_stats', {})
-            stats_unified = {
-                "step_time_variance": overall.get('stddev_us', 0.0) ** 2 if overall.get('stddev_us') else None,
-                "kernel_time_variance": overall.get('stddev_us', 0.0) ** 2 if overall.get('stddev_us') else None,
-                "num_outlier_steps": None,  # Not tracked
-            }
-
-        # Create unified result
-        result = create_unified_result(
-            # Metadata
-            platform="TPU" if device_type.startswith("TPU") else "GPU",
-            device_type=device_type,
-            trace_file=str(self.trace_file),
-            framework="Flax",
-            num_devices=num_devices,
-
-            # Model Config
-            model_dims=self.config.model_dims,
-            num_layers=self.config.num_layers,
-            num_heads=self.config.num_heads,
-            batch_size=self.config.batch_size,
-            seq_length=self.config.seq_length,
-            vocab_size=self.config.vocab_size,
-            ffn_hidden_dims=self.config.ffn_hidden_dims,
-            num_items=self.config.num_items,
-            num_clusters=self.config.num_clusters,
-            pretrained_model=self.config.pretrained_model,
-
-            # Parameters (Flax doesn't track frozen params separately)
-            total_params=self.config.calculate_params() if self.config.is_valid() else 0,
-
-            # Step Timing
-            num_steps=step_stats.get('num_steps', 0) if step_stats else 0,
-            total_time_us=step_stats.get('total_us', 0.0) if step_stats else 0.0,
-            avg_step_time_us=step_stats.get('avg_us', 0.0) if step_stats else 0.0,
-            total_kernels=step_stats.get('total_kernels', 0) if step_stats else 0,
-            kernels_per_step=step_stats.get('kernels_per_step', 0.0) if step_stats else 0.0,
-            step_count_source=step_stats.get('step_source', 'heuristic') if step_stats else 'unknown',
-
-            # Throughput
-            tokens_per_sec=throughput.get('tokens_per_sec', 0.0),
-            samples_per_sec=throughput.get('samples_per_sec', 0.0),
-            steps_per_sec=throughput.get('steps_per_sec', 0.0),
-            ms_per_step=throughput.get('ms_per_step', 0.0),
-            tokens_per_batch=throughput.get('tokens_per_batch', 0),
-
-            # Compute Utilization
-            compute_util_percent=gpu_util.get('gpu_compute_util_pct', 0.0),
-            kernel_time_us=gpu_util.get('kernel_time_us', 0.0),
-            overhead_time_us=gpu_util.get('overhead_time_us', 0.0),
-
-            # Kernels
-            top_kernels=top_kernels,
-            kernels_by_category=kernels_by_op,
-
-            # Optional sections
-            memory_ops=memory_unified,
-            multi_device=multi_device_unified,
-            timeline_gaps=timeline_unified,
-            compilation=compilation_unified,
-            io_operations=io_unified,
-            statistical_performance=stats_unified,
-            xla_operations=xla_ops,
-        )
-
-        return result
-
 
 def main():
     parser = argparse.ArgumentParser(
@@ -1319,7 +1124,6 @@ Examples:
     parser.add_argument('--trace_file', type=str, required=True, help='Path to trace.json.gz')
     parser.add_argument('--checkpoint_dir', type=str, help='Checkpoint directory (auto-detected if not provided)')
     parser.add_argument('--num_steps', type=int, help='Number of steps captured (overrides auto-detection)')
-    parser.add_argument('--output_json', type=str, help='Save results to JSON file (unified format for comparison)')
 
     args = parser.parse_args()
 
@@ -1328,26 +1132,7 @@ Examples:
         return 1
 
     analyzer = ProfileAnalyzer(args.trace_file, args.checkpoint_dir, args.num_steps)
-
-    # Always print console summary
     analyzer.print_summary()
-
-    # Optionally export to JSON
-    if args.output_json:
-        if not HAS_SCHEMA:
-            print(f"\n❌ Error: Cannot export JSON - profiling_schema.py not found")
-            print("   Make sure profiling_schema.py is in the same directory")
-            return 1
-
-        print(f"\n📊 Generating unified JSON output...")
-        result = analyzer.generate_unified_result()
-        if result:
-            save_profiling_json(result, args.output_json)
-            print(f"\n💡 You can now compare this profile with GPU results using:")
-            print(f"   python compare_profiles.py --tpu {args.output_json} --gpu <gpu_profile.json>")
-        else:
-            print(f"❌ Failed to generate JSON output")
-            return 1
 
     return 0
 
