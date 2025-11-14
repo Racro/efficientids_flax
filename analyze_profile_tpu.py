@@ -287,6 +287,7 @@ class ProfileAnalyzer:
                     max_seq_len_match = re.search(r'max_seq_len\s*=\s*(\d+)', func_body)
                     num_items_match = re.search(r'num_items\s*=\s*(\d+)', func_body)
                     num_clusters_match = re.search(r'num_clusters\s*=\s*(\d+)', func_body)
+                    item_embedding_dim_match = re.search(r'item_embedding_dim\s*=\s*(\d+)', func_body)
 
                     if model_dims_match:
                         config.model_dims = int(model_dims_match.group(1))
@@ -298,6 +299,8 @@ class ProfileAnalyzer:
                         config.num_items = int(num_items_match.group(1))
                     if num_clusters_match:
                         config.num_clusters = int(num_clusters_match.group(1))
+                    if item_embedding_dim_match:
+                        config.item_embedding_dim = int(item_embedding_dim_match.group(1))
 
                     # Gemma 2B specs
                     config.num_layers = 18
@@ -1526,6 +1529,7 @@ class ProfileAnalyzer:
             ffn_hidden_dims=self.config.ffn_hidden_dims,
             num_items=self.config.num_items,
             num_clusters=self.config.num_clusters,
+            item_embedding_dim=self.config.item_embedding_dim,
             pretrained_model=self.config.pretrained_model,
 
             # Parameters (Flax doesn't track frozen params separately)

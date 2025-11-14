@@ -16,6 +16,9 @@ import time
 from pathlib import Path
 import orbax.checkpoint as ocp
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class TrainState(train_state.TrainState):
@@ -84,6 +87,7 @@ class Trainer:
 
         # Profiling setup
         self.profiler = None
+        self.flop_counter = None
         if enable_profiling:
             from .profiler import Profiler
             profiler_dir = self.checkpoint_dir / "profiler_traces"
@@ -91,6 +95,7 @@ class Trainer:
                 num_steps=profiler_num_steps,
                 log_dir=str(profiler_dir),
                 auto_enable_at_step=profiler_start_step,
+                flop_counter=None,  # Will be set after model initialization
             )
 
         # Detect platform
@@ -267,7 +272,31 @@ class Trainer:
             grad_accum_count=0,
         )
 
+        # Initialize FLOP counter for profiling
+        if self.profiler is not None:
+            self._init_flop_counter(state)
+
         return state
+
+    def _init_flop_counter(self, state: TrainState):
+        """Initialize FLOP counter for MFU tracking."""
+        try:
+            from .flop_counter import create_flop_counter_from_model
+
+            logger.info("Initializing FLOP counter...")
+            self.flop_counter = create_flop_counter_from_model(
+                model=self.model,
+                params=state.params,
+            )
+
+            # Update profiler with FLOP counter
+            if self.profiler is not None:
+                self.profiler.flop_counter = self.flop_counter
+                logger.info("FLOP counter attached to profiler")
+
+        except Exception as e:
+            logger.warning(f"Failed to initialize FLOP counter: {e}")
+            logger.warning("Profiling will continue without MFU tracking")
 
     def _merge_pretrained_params(
         self,
@@ -494,12 +523,25 @@ class Trainer:
 
             # Training step
             step_start = time.time()
-            state, metrics = train_step_jit(state, batch)
+            with jax.profiler.StepTraceAnnotation('train', step_num=step):
+                state, metrics = train_step_jit(state, batch)
+
+            # CRITICAL: Block until computation completes before profiler end_step
+            # This prevents segfault when stopping profiler with in-flight computations
+            jax.block_until_ready(metrics['loss'])
             step_time = time.time() - step_start
 
             # Profiler: end step
             if self.profiler is not None:
-                self.profiler.end_step()
+                # Calculate tokens processed (batch_size * seq_len)
+                num_tokens = None
+                if 'input_ids' in batch:
+                    # batch_size * seq_len
+                    num_tokens = int(batch['input_ids'].shape[0] * batch['input_ids'].shape[1])
+                elif 'targets' in batch:
+                    num_tokens = int(batch['targets'].shape[0] * batch['targets'].shape[1])
+
+                self.profiler.end_step(num_tokens=num_tokens)
 
             # Accumulate metrics
             metrics_history.append(metrics)
@@ -515,11 +557,27 @@ class Trainer:
                 elapsed = time.time() - start_time
                 steps_per_sec = self.log_every / elapsed
 
+                # Calculate tokens/sec and MFU if FLOP counter available
+                mfu_str = ""
+                if self.flop_counter is not None:
+                    # Estimate tokens/sec from recent steps
+                    num_tokens = 0
+                    if 'input_ids' in batch:
+                        num_tokens = int(batch['input_ids'].shape[0] * batch['input_ids'].shape[1])
+                    elif 'targets' in batch:
+                        num_tokens = int(batch['targets'].shape[0] * batch['targets'].shape[1])
+
+                    if num_tokens > 0:
+                        tokens_per_sec = (num_tokens * self.log_every) / elapsed
+                        mfu = self.flop_counter.compute_mfu(tokens_per_sec)
+                        achieved_tflops = self.flop_counter.compute_achieved_flops(tokens_per_sec)
+                        mfu_str = f" | {tokens_per_sec:.0f} tok/s | {achieved_tflops:.1f}/{self.flop_counter.peak_flops:.1f} TFLOP/s | MFU: {mfu:.1f}%"
+
                 print(f"Step {step + 1}/{num_steps} | "
                       f"Loss: {avg_metrics['loss']:.4f} | "
                       f"Grad norm: {avg_metrics['grad_norm']:.2f} | "
                       f"Cluster acc: {avg_metrics.get('cluster_accuracy', 0.0):.3f} | "
-                      f"{steps_per_sec:.1f} steps/s")
+                      f"{steps_per_sec:.1f} steps/s{mfu_str}")
 
                 start_time = time.time()
 
