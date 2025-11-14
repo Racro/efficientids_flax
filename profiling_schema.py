@@ -67,6 +67,12 @@ def create_unified_result(
     tokens_per_sec_per_device: Optional[float] = None,
     samples_per_sec_per_device: Optional[float] = None,
 
+    # FLOP Statistics (MFU)
+    mfu_percent: Optional[float] = None,
+    achieved_tflops: Optional[float] = None,
+    peak_tflops: Optional[float] = None,
+    flops_per_token: Optional[int] = None,
+
     # Timeline Coverage (NOT hardware utilization!)
     # This measures % of time with kernels executing, not how efficiently hardware is used
     # For true HW utilization, use nvidia-smi (GPU) or cloud monitoring (TPU)
@@ -153,6 +159,13 @@ def create_unified_result(
             "samples_per_sec_per_device": samples_per_sec_per_device,
             "_note_per_device": "Per-device metrics are effective (total / num_devices), not actual single-device throughput",
         },
+        "flop_stats": {
+            "mfu_percent": mfu_percent,
+            "achieved_tflops": achieved_tflops,
+            "peak_tflops": peak_tflops,
+            "flops_per_token": flops_per_token,
+            "_note": "MFU = (Achieved TFLOP/s) / (Peak TFLOP/s). Measures compute efficiency.",
+        } if mfu_percent is not None else None,
         "timeline_coverage": {
             "_note": "Timeline coverage, NOT hardware utilization. Use nvidia-smi/cloud monitoring for HW metrics.",
             "timeline_coverage_percent": timeline_coverage_percent,
