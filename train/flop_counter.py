@@ -20,8 +20,9 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-# GPU theoretical peak FLOP/s (in TFLOP/s for FP16/BF16)
+# GPU/TPU theoretical peak FLOP/s (in TFLOP/s for FP16/BF16)
 GPU_PEAK_FLOPS = {
+    # GPUs
     'A100': 312.0,  # TFLOP/s for FP16/BF16
     'A100-80GB': 312.0,
     'H100': 989.0,  # TFLOP/s for FP16/BF16
@@ -29,9 +30,11 @@ GPU_PEAK_FLOPS = {
     'V100': 125.0,  # TFLOP/s for FP16
     'T4': 65.0,  # TFLOP/s for FP16
     'L4': 121.0,  # TFLOP/s for FP16/BF16
-    # TPU v4 pod slice
+    # TPUs
     'TPU-v4': 275.0,  # TFLOP/s per chip (BF16)
     'TPU-v5e': 197.0,  # TFLOP/s per chip (BF16)
+    'TPU-v6e': 197.0,  # TFLOP/s per chip (BF16) - same as v5e
+    'TPU v6e': 197.0,  # Alternative naming
 }
 
 
@@ -74,6 +77,7 @@ class FLOPCounter:
         num_layers: Number of transformer layers
         num_heads: Number of attention heads
         vocab_size: Vocabulary size (for output projection)
+        trainable_params: Number of trainable parameters (defaults to num_params if None)
         peak_flops: Theoretical peak FLOP/s in TFLOP/s (auto-detected if None)
         use_mixed_precision: Whether using FP16/BF16 (affects peak FLOP/s)
     """
@@ -85,10 +89,12 @@ class FLOPCounter:
         num_layers: int,
         num_heads: int,
         vocab_size: int,
+        trainable_params: Optional[int] = None,
         peak_flops: Optional[float] = None,
         use_mixed_precision: bool = True,
     ):
         self.num_params = num_params
+        self.trainable_params = trainable_params if trainable_params is not None else num_params
         self.model_dims = model_dims
         self.num_layers = num_layers
         self.num_heads = num_heads
@@ -105,7 +111,13 @@ class FLOPCounter:
         self.peak_flops_absolute = self.peak_flops * 1e12
 
         logger.info(f"FLOPCounter initialized:")
-        logger.info(f"  Model params: {num_params:,}")
+        logger.info(f"  Total params: {num_params:,}")
+        if self.trainable_params != num_params:
+            frozen_pct = ((num_params - self.trainable_params) / num_params) * 100
+            logger.info(f"  Trainable params: {self.trainable_params:,} ({100-frozen_pct:.1f}%)")
+            logger.info(f"  Frozen params: {num_params - self.trainable_params:,} ({frozen_pct:.1f}%)")
+        else:
+            logger.info(f"  Trainable params: {self.trainable_params:,} (100%)")
         logger.info(f"  Hidden dims: {model_dims}")
         logger.info(f"  Layers: {num_layers}")
         logger.info(f"  Vocab size: {vocab_size}")
@@ -116,18 +128,22 @@ class FLOPCounter:
         Estimate FLOPs per token (forward + backward pass).
 
         Uses the standard formula:
-        FLOPs ≈ 6 * num_params (for forward + backward)
+        FLOPs ≈ 6 * trainable_params (for forward + backward)
 
         For transformer specifically:
-        - Forward: 2 * num_params (matrix multiplications)
-        - Backward: 4 * num_params (gradient computation)
+        - Forward: 2 * trainable_params (matrix multiplications)
+        - Backward: 4 * trainable_params (gradient computation)
+
+        NOTE: Uses trainable_params (not total params) because frozen weights
+        don't require backward pass computation.
 
         Returns:
             FLOPs per token (forward + backward)
         """
-        # Rough estimate: 6 * params per token
+        # Rough estimate: 6 * trainable params per token
         # This is a common approximation for transformers
-        flops_per_token = 6 * self.num_params
+        # IMPORTANT: Use trainable_params for fine-tuning with frozen layers!
+        flops_per_token = 6 * self.trainable_params
 
         return flops_per_token
 
@@ -395,7 +411,7 @@ def create_flop_counter_from_model(
     """
     Create a FLOPCounter from a Flax model instance.
 
-    Automatically extracts model configuration.
+    Automatically extracts model configuration and detects frozen parameters.
 
     Args:
         model: Flax model instance
@@ -409,6 +425,41 @@ def create_flop_counter_from_model(
     """
     # Count total parameters
     num_params = sum(x.size for x in jax.tree_util.tree_leaves(params))
+
+    # Detect trainable parameters (for models with frozen weights)
+    trainable_params = None
+    freeze_lm = getattr(model, 'freeze_lm', False)
+    freeze_gemma = getattr(model, 'freeze_gemma', False)
+    freeze_llama = getattr(model, 'freeze_llama', False)
+
+    if freeze_lm or freeze_gemma or freeze_llama:
+        # Model has frozen weights - count only trainable params
+        # For EfficientIDS, this is typically:
+        # - Item embeddings
+        # - Cluster embeddings
+        # - Item input/output adapters
+        # - Hierarchical softmax layers
+        try:
+            trainable_count = 0
+            param_tree = jax.tree_util.tree_map_with_path(
+                lambda path, x: x.size,
+                params
+            )
+
+            # Count params NOT in gemma/llama/lm submodules
+            for key_path, size in jax.tree_util.tree_leaves_with_path(param_tree):
+                path_str = '/'.join(str(k) for k in key_path)
+                # Skip frozen transformer params
+                if not any(frozen_name in path_str.lower()
+                          for frozen_name in ['gemma_transformer', 'llama', 'lm']):
+                    trainable_count += size
+
+            if trainable_count > 0 and trainable_count < num_params:
+                trainable_params = trainable_count
+                logger.info(f"Detected frozen model: {trainable_params:,} trainable / {num_params:,} total params")
+        except Exception as e:
+            logger.warning(f"Failed to count trainable params: {e}")
+            logger.warning("Using total params for FLOP estimation (may overestimate)")
 
     # Try to extract model config
     try:
@@ -430,7 +481,9 @@ def create_flop_counter_from_model(
         num_heads = 16
 
         logger.info(f"Auto-detected model config:")
-        logger.info(f"  Params: {num_params:,}")
+        logger.info(f"  Total params: {num_params:,}")
+        if trainable_params:
+            logger.info(f"  Trainable params: {trainable_params:,} ({trainable_params/num_params*100:.1f}%)")
         logger.info(f"  Model dims: {model_dims}")
         logger.info(f"  Vocab: {vocab_size:,}")
 
@@ -443,10 +496,10 @@ def create_flop_counter_from_model(
 
     return FLOPCounter(
         num_params=num_params,
+        trainable_params=trainable_params,
         model_dims=model_dims,
         num_layers=num_layers,
         num_heads=num_heads,
         vocab_size=vocab_size,
         peak_flops=peak_flops,
     )
-
