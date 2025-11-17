@@ -35,6 +35,7 @@ GPU_PEAK_FLOPS = {
     'TPU-v5e': 197.0,  # TFLOP/s per chip (BF16)
     'TPU-v6e': 197.0,  # TFLOP/s per chip (BF16) - same as v5e
     'TPU v6e': 197.0,  # Alternative naming
+    'TPU v6 lite': 197.0,  # TPU v6e lite (actual device_kind string from JAX)
 }
 
 
@@ -49,19 +50,26 @@ def detect_device_flops() -> float:
         device = jax.devices()[0]
         device_kind = device.device_kind
 
-        # Check known GPU types
-        for gpu_name, flops in GPU_PEAK_FLOPS.items():
-            if gpu_name.lower() in device_kind.lower():
-                logger.info(f"Detected device: {device_kind} → {flops} TFLOP/s (FP16/BF16)")
+        logger.info(f"Detecting device: {device} (kind: {device_kind})")
+
+        # Check known GPU/TPU types
+        for device_name, flops in GPU_PEAK_FLOPS.items():
+            if device_name.lower() in device_kind.lower():
+                logger.info(f"✓ Matched device: {device_kind} → {flops} TFLOP/s (BF16)")
                 return flops
 
-        # Unknown device
-        logger.warning(f"Unknown device: {device_kind}. Cannot estimate peak FLOP/s.")
-        logger.warning(f"Please manually set peak_flops when creating FLOPCounter.")
+        # Unknown device - log all available info for debugging
+        logger.warning(f"⚠️  Unknown device: {device_kind}")
+        logger.warning(f"   Device object: {device}")
+        logger.warning(f"   All devices: {jax.devices()}")
+        logger.warning(f"   Available in GPU_PEAK_FLOPS: {list(GPU_PEAK_FLOPS.keys())}")
+        logger.warning(f"   Cannot estimate peak FLOP/s - will return 0")
         return 0.0
 
     except Exception as e:
         logger.warning(f"Failed to detect device: {e}")
+        import traceback
+        logger.warning(traceback.format_exc())
         return 0.0
 
 
@@ -428,9 +436,25 @@ def create_flop_counter_from_model(
 
     # Detect trainable parameters (for models with frozen weights)
     trainable_params = None
+
+    # Try multiple ways to detect frozen model
     freeze_lm = getattr(model, 'freeze_lm', False)
     freeze_gemma = getattr(model, 'freeze_gemma', False)
     freeze_llama = getattr(model, 'freeze_llama', False)
+
+    # Debug: Log what we found
+    logger.info(f"Freeze detection: freeze_lm={freeze_lm}, freeze_gemma={freeze_gemma}, freeze_llama={freeze_llama}")
+
+    # Also check if model class has these as defaults
+    if not (freeze_lm or freeze_gemma or freeze_llama):
+        model_class = type(model)
+        if hasattr(model_class, '__dataclass_fields__'):
+            # Flax dataclass module
+            fields = model_class.__dataclass_fields__
+            freeze_gemma = fields.get('freeze_gemma', type('', (), {'default': False})).default
+            freeze_llama = fields.get('freeze_llama', type('', (), {'default': False})).default
+            freeze_lm = fields.get('freeze_lm', type('', (), {'default': False})).default
+            logger.info(f"From dataclass defaults: freeze_lm={freeze_lm}, freeze_gemma={freeze_gemma}, freeze_llama={freeze_llama}")
 
     if freeze_lm or freeze_gemma or freeze_llama:
         # Model has frozen weights - count only trainable params
@@ -441,25 +465,43 @@ def create_flop_counter_from_model(
         # - Hierarchical softmax layers
         try:
             trainable_count = 0
+            frozen_count = 0
             param_tree = jax.tree_util.tree_map_with_path(
                 lambda path, x: x.size,
                 params
             )
 
+            # Debug: Log first few param paths to see structure
+            logger.info("Sample param paths (first 10):")
+            for i, (key_path, size) in enumerate(jax.tree_util.tree_leaves_with_path(param_tree)):
+                if i < 10:
+                    path_str = '/'.join(str(k) for k in key_path)
+                    logger.info(f"  {path_str}: {size:,}")
+
             # Count params NOT in gemma/llama/lm submodules
+            frozen_patterns = ['gemma_transformer', 'llama', 'transformer', 'lm_tpl']
             for key_path, size in jax.tree_util.tree_leaves_with_path(param_tree):
                 path_str = '/'.join(str(k) for k in key_path)
                 # Skip frozen transformer params
-                if not any(frozen_name in path_str.lower()
-                          for frozen_name in ['gemma_transformer', 'llama', 'lm']):
+                is_frozen = any(frozen_name in path_str.lower() for frozen_name in frozen_patterns)
+                if is_frozen:
+                    frozen_count += size
+                else:
                     trainable_count += size
+
+            logger.info(f"Param counting result: trainable={trainable_count:,}, frozen={frozen_count:,}, total={num_params:,}")
 
             if trainable_count > 0 and trainable_count < num_params:
                 trainable_params = trainable_count
-                logger.info(f"Detected frozen model: {trainable_params:,} trainable / {num_params:,} total params")
+                logger.info(f"✓ Detected frozen model: {trainable_params:,} trainable / {num_params:,} total params")
+            else:
+                logger.warning(f"⚠️  Failed to detect frozen params (trainable={trainable_count}, total={num_params})")
+                logger.warning("    Using total params for FLOP estimation (may overestimate)")
         except Exception as e:
             logger.warning(f"Failed to count trainable params: {e}")
             logger.warning("Using total params for FLOP estimation (may overestimate)")
+            import traceback
+            logger.warning(traceback.format_exc())
 
     # Try to extract model config
     try:

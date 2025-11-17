@@ -310,6 +310,65 @@ def get_gemma_config(
     )
 
 
+def get_gemma_scratch_config(
+    num_items: int = 3261,
+    num_clusters: int = 100,
+    max_seq_len: int = 128,
+    batch_size: int = 16,
+    max_steps: int = 10000,
+) -> EfficientIDSConfig:
+    """
+    Configuration for Gemma-sized architecture trained from scratch.
+
+    Uses Gemma 2B architecture dimensions but initializes randomly.
+    All weights are trainable (no pretrained model loaded).
+
+    Gemma 2B specs:
+    - hidden_size: 2048
+    - num_layers: 18
+    - num_heads: 8
+    """
+    return EfficientIDSConfig(
+        model=ModelConfig(
+            num_items=num_items,
+            num_clusters=num_clusters,
+            item_embedding_dim=384,
+            model_dims=2048,  # Gemma 2B hidden size
+            use_hierarchical_softmax=True,
+            use_correction=True,
+            pretrained_lm_name=None,  # No pretrained model
+            freeze_lm=False,  # All weights trainable
+        ),
+        training=TrainingConfig(
+            max_steps=max_steps,
+            warmup_steps=1000,
+            batch_size=batch_size,
+            max_seq_len=max_seq_len,
+            learning_rate=1e-4,  # Higher LR for training from scratch
+            schedule_type='cosine',
+            optimizer_type='adamw',
+            weight_decay=0.01,
+            clip_grad_norm=1.0,
+            log_every=100,
+            eval_every=1000,
+            save_every=1000,
+        ),
+        data=DataConfig(
+            data_dir="./data/ml1m_processed/processed",
+            mode='id_only',
+            embedding_init_method='metadata',
+        ),
+        eval=EvalConfig(
+            k_values=[1, 5, 10],
+            metric_types=['recall', 'mrr', 'ndcg', 'accuracy'],
+            num_eval_batches=100,
+        ),
+        checkpoint_dir="./checkpoints/gemma_scratch",
+        log_dir="./logs/gemma_scratch",
+        experiment_name="gemma_scratch",
+    )
+
+
 def get_debug_config() -> EfficientIDSConfig:
     """
     Minimal configuration for debugging and testing.

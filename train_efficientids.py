@@ -38,6 +38,7 @@ from configs.config import (
     get_qwen_config,
     get_llama_config,
     get_gemma_config,
+    get_gemma_scratch_config,
     get_debug_config,
     get_tpu_optimized_config,
     EfficientIDSConfig,
@@ -240,6 +241,14 @@ def main(args):
             batch_size=args.batch_size,
             max_steps=args.max_steps,
         )
+    elif args.config == 'gemma_scratch':
+        config = get_gemma_scratch_config(
+            num_items=args.num_items,
+            num_clusters=args.num_clusters,
+            max_seq_len=args.max_seq_len,
+            batch_size=args.batch_size,
+            max_steps=args.max_steps,
+        )
     elif args.config == 'debug':
         config = get_debug_config()
     else:
@@ -435,7 +444,7 @@ if __name__ == "__main__":
         '--config',
         type=str,
         default='qwen',
-        choices=['qwen', 'llama', 'debug', 'gemma', 'tpu_optimized'],
+        choices=['qwen', 'llama', 'debug', 'gemma', 'gemma_scratch', 'tpu_optimized'],
         help='Preset configuration to use'
     )
 
