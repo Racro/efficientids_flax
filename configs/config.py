@@ -310,15 +310,151 @@ def get_gemma_config(
     )
 
 
-def get_gemma_scratch_config(
+def get_gemma_7b_config(
+    num_items: int = 3261,
+    num_clusters: int = 100,
+    item_embedding_dim: int = 384,
+    max_seq_len: int = 128,
+    max_steps: int = 500,
+) -> EfficientIDSConfig:
+    """
+    TPU-optimized configuration for FROZEN PRETRAINED Gemma 7B.
+
+    Similar to gemma_2b but for Gemma 7B (larger model).
+
+    Gemma 7B specs:
+    - hidden_size: 3072
+    - num_layers: 28
+    - num_heads: 16
+    - num_kv_heads: 16 (full MHA, not GQA)
+
+    Optimized for TPU v6e-4 (4 chips):
+    - Smaller batch size (8 vs 16) due to larger model
+    - Gradient checkpointing (remat): ~50% memory savings
+    - Mixed precision (bfloat16): ~50% memory savings
+    - Frozen LM: Only train item embeddings + adapters
+
+    Expected memory: ~8-10GB per chip with Gemma 7B frozen
+    """
+    return EfficientIDSConfig(
+        model=ModelConfig(
+            num_items=num_items,
+            num_clusters=num_clusters,
+            item_embedding_dim=item_embedding_dim,
+            model_dims=3072,  # Gemma 7B hidden size
+            use_hierarchical_softmax=True,
+            use_correction=True,
+            pretrained_lm_name="gemma-7b",  # PRETRAINED MODEL
+            freeze_lm=True,  # FREEZE transformer weights
+        ),
+        training=TrainingConfig(
+            max_steps=max_steps,
+            warmup_steps=50,
+            batch_size=16,  # Smaller batch for larger model (2 per chip)
+            eval_batch_size=8,
+            max_seq_len=max_seq_len,
+            learning_rate=5e-5,  # Lower LR for pretrained
+            schedule_type='cosine',
+            optimizer_type='adamw',
+            weight_decay=0.01,
+            clip_grad_norm=1.0,
+            log_every=50,
+            eval_every=1000,
+            save_every=1000,
+            # MEMORY OPTIMIZATIONS (critical for 7B)
+            use_remat=True,  # Gradient checkpointing
+            use_mixed_precision=True,  # bfloat16 training
+            gradient_accumulation_steps=1,
+        ),
+        data=DataConfig(
+            data_dir="./data/ml1m_processed/processed",
+            mode='id_only',
+            embedding_init_method='metadata',  # Item embeddings from metadata
+        ),
+        eval=EvalConfig(
+            k_values=[1, 5, 10],
+            metric_types=['recall', 'mrr', 'accuracy'],
+            num_eval_batches=50,
+        ),
+        checkpoint_dir="./checkpoints/gemma_7b_frozen",
+        log_dir="./logs/gemma_7b_frozen",
+        experiment_name="gemma_7b_frozen",
+    )
+
+
+def get_gemma_7b_scratch_config(
     num_items: int = 3261,
     num_clusters: int = 100,
     max_seq_len: int = 128,
     batch_size: int = 16,
-    max_steps: int = 10000,
+    max_steps: int = 500,
 ) -> EfficientIDSConfig:
     """
-    Configuration for Gemma-sized architecture trained from scratch.
+    Configuration for Gemma 7B-sized architecture trained from SCRATCH.
+
+    Similar to gemma_2b_scratch but for Gemma 7B architecture.
+    Uses Gemma 7B architecture dimensions but initializes randomly.
+    All weights are trainable (no pretrained model loaded).
+
+    Gemma 7B specs:
+    - hidden_size: 3072
+    - num_layers: 28
+    - num_heads: 16
+    - num_kv_heads: 16
+
+    Note: Much more expensive than frozen - trains full 7B parameter model.
+    Requires significant compute and data.
+    """
+    return EfficientIDSConfig(
+        model=ModelConfig(
+            num_items=num_items,
+            num_clusters=num_clusters,
+            item_embedding_dim=384,
+            model_dims=3072,  # Gemma 7B hidden size
+            use_hierarchical_softmax=True,
+            use_correction=True,
+            pretrained_lm_name=None,  # No pretrained model
+            freeze_lm=False,  # All weights trainable
+        ),
+        training=TrainingConfig(
+            max_steps=max_steps,
+            warmup_steps=50,
+            batch_size=batch_size,  # Small batch for training from scratch
+            max_seq_len=max_seq_len,
+            learning_rate=1e-4,  # Higher LR for training from scratch
+            schedule_type='cosine',
+            optimizer_type='adamw',
+            weight_decay=0.01,
+            clip_grad_norm=1.0,
+            log_every=100,
+            eval_every=1000,
+            save_every=1000,
+        ),
+        data=DataConfig(
+            data_dir="./data/ml1m_processed/processed",
+            mode='id_only',
+            embedding_init_method='metadata',
+        ),
+        eval=EvalConfig(
+            k_values=[1, 5, 10],
+            metric_types=['recall', 'mrr', 'ndcg', 'accuracy'],
+            num_eval_batches=100,
+        ),
+        checkpoint_dir="./checkpoints/gemma_7b_scratch",
+        log_dir="./logs/gemma_7b_scratch",
+        experiment_name="gemma_7b_scratch",
+    )
+
+
+def get_gemma_2b_scratch_config(
+    num_items: int = 3261,
+    num_clusters: int = 100,
+    max_seq_len: int = 128,
+    batch_size: int = 16,
+    max_steps: int = 500,
+) -> EfficientIDSConfig:
+    """
+    Configuration for Gemma 2B architecture trained from scratch.
 
     Uses Gemma 2B architecture dimensions but initializes randomly.
     All weights are trainable (no pretrained model loaded).
@@ -341,7 +477,7 @@ def get_gemma_scratch_config(
         ),
         training=TrainingConfig(
             max_steps=max_steps,
-            warmup_steps=1000,
+            warmup_steps=50,
             batch_size=batch_size,
             max_seq_len=max_seq_len,
             learning_rate=1e-4,  # Higher LR for training from scratch
@@ -363,9 +499,9 @@ def get_gemma_scratch_config(
             metric_types=['recall', 'mrr', 'ndcg', 'accuracy'],
             num_eval_batches=100,
         ),
-        checkpoint_dir="./checkpoints/gemma_scratch",
-        log_dir="./logs/gemma_scratch",
-        experiment_name="gemma_scratch",
+        checkpoint_dir="./checkpoints/gemma_2b_scratch",
+        log_dir="./logs/gemma_2b_scratch",
+        experiment_name="gemma_2b_scratch",
     )
 
 
@@ -405,19 +541,19 @@ def get_debug_config() -> EfficientIDSConfig:
     )
 
 
-def get_tpu_optimized_config(
+def get_gemma_2b_config(
     num_items: int = 3261,
     num_clusters: int = 100,
     item_embedding_dim: int = 384,
-    pretrained_lm_name: str = "google/gemma-2b",  # Pretrained model
+    pretrained_lm_name: str = "gemma-2b",  # Pretrained model
     max_seq_len: int = 128,
-    max_steps: int = 10000,
+    max_steps: int = 500,
 ) -> EfficientIDSConfig:
     """
-    TPU-optimized configuration with FROZEN PRETRAINED LM and memory optimizations.
+    TPU-optimized configuration for FROZEN PRETRAINED Gemma 2B.
 
     Uses:
-    - Pretrained Gemma 2B (or Llama) - FROZEN
+    - Pretrained Gemma 2B - FROZEN
     - Item embeddings from metadata (384 dim)
     - Model dims from pretrained LM (2048 for Gemma 2B)
     - Memory optimizations: remat + bfloat16
@@ -443,7 +579,7 @@ def get_tpu_optimized_config(
         ),
         training=TrainingConfig(
             max_steps=max_steps,
-            warmup_steps=1000,
+            warmup_steps=50,
             batch_size=16,  # Total batch across 4 devices (4 per chip)
             eval_batch_size=16,
             max_seq_len=max_seq_len,
@@ -453,7 +589,7 @@ def get_tpu_optimized_config(
             weight_decay=0.01,
             clip_grad_norm=1.0,
             log_every=50,
-            eval_every=500,
+            eval_every=1000,
             save_every=1000,
             # MEMORY OPTIMIZATIONS
             use_remat=True,  # Gradient checkpointing
@@ -470,9 +606,9 @@ def get_tpu_optimized_config(
             metric_types=['recall', 'mrr', 'accuracy'],
             num_eval_batches=50,
         ),
-        checkpoint_dir="./checkpoints/tpu_gemma",
-        log_dir="./logs/tpu_gemma",
-        experiment_name="tpu_gemma_frozen",
+        checkpoint_dir="./checkpoints/gemma_2b_frozen",
+        log_dir="./logs/gemma_2b_frozen",
+        experiment_name="gemma_2b_frozen",
     )
 
 

@@ -38,9 +38,11 @@ from configs.config import (
     get_qwen_config,
     get_llama_config,
     get_gemma_config,
-    get_gemma_scratch_config,
+    get_gemma_2b_config,
+    get_gemma_2b_scratch_config,
+    get_gemma_7b_config,
+    get_gemma_7b_scratch_config,
     get_debug_config,
-    get_tpu_optimized_config,
     EfficientIDSConfig,
 )
 from data.dataset import create_dataloaders, ClusteringInfo
@@ -180,21 +182,32 @@ def create_gemma_model(config: EfficientIDSConfig, clustering_info: ClusteringIn
         traceback.print_exc()
         gemma_params_flax = None
 
+    # Determine model architecture based on model name
+    if config.model.pretrained_lm_name == "gemma-7b":
+        num_layers, num_heads, num_kv_heads, intermediate_dim = 28, 16, 16, 24576
+    else:  # gemma-2b or default
+        num_layers, num_heads, num_kv_heads, intermediate_dim = 18, 8, 1, 16384
+
     # Create model with Gemma dimensions
     model = GemmaEfficientIDSModel(
         num_items=config.model.num_items,
         num_clusters=config.model.num_clusters,
         item_embedding_dim=config.model.item_embedding_dim,
-        model_dims=2048,  # Gemma 2B hidden size
+        model_dims=config.model.model_dims,  # 2048 for Gemma 2B, 3072 for Gemma 7B
         clustering_info=clustering_info,
         freeze_gemma=freeze_gemma,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        intermediate_dim=intermediate_dim,
     )
 
     logger.info("Model created:")
     logger.info(f"  Items: {config.model.num_items}")
     logger.info(f"  Clusters: {config.model.num_clusters}")
     logger.info(f"  Item embedding dim: {config.model.item_embedding_dim}")
-    logger.info(f"  Model dims: 2048 (Gemma 2B)")
+    logger.info(f"  Model dims: {config.model.model_dims} ({config.model.pretrained_lm_name or 'Gemma 2B'})")
+    logger.info(f"  Layers: {num_layers}, Heads: {num_heads}, KV Heads: {num_kv_heads}")
     logger.info(f"  Freeze Gemma: {freeze_gemma}")
 
     return model, gemma_params_flax
@@ -225,8 +238,8 @@ def main(args):
             batch_size=args.batch_size,
             max_steps=args.max_steps,
         )
-    elif args.config == 'tpu_optimized':
-        config = get_tpu_optimized_config(
+    elif args.config == 'gemma_2b':
+        config = get_gemma_2b_config(
             num_items=args.num_items,
             num_clusters=args.num_clusters,
             item_embedding_dim=args.item_embedding_dim,
@@ -241,8 +254,23 @@ def main(args):
             batch_size=args.batch_size,
             max_steps=args.max_steps,
         )
-    elif args.config == 'gemma_scratch':
-        config = get_gemma_scratch_config(
+    elif args.config == 'gemma_7b':
+        config = get_gemma_7b_config(
+            num_items=args.num_items,
+            num_clusters=args.num_clusters,
+            max_seq_len=args.max_seq_len,
+            max_steps=args.max_steps,
+        )
+    elif args.config == 'gemma_7b_scratch':
+        config = get_gemma_7b_scratch_config(
+            num_items=args.num_items,
+            num_clusters=args.num_clusters,
+            max_seq_len=args.max_seq_len,
+            batch_size=args.batch_size,
+            max_steps=args.max_steps,
+        )
+    elif args.config == 'gemma_2b_scratch':
+        config = get_gemma_2b_scratch_config(
             num_items=args.num_items,
             num_clusters=args.num_clusters,
             max_seq_len=args.max_seq_len,
@@ -301,9 +329,20 @@ def main(args):
 
     if use_pretrained:
         logger.info(f"Using pretrained model: {config.model.pretrained_lm_name or 'gemma from args'}")
+
+        # Auto-detect checkpoint path based on model size
+        pretrained_path = args.pretrained_path
+        if pretrained_path == 'auto':
+            if config.model.pretrained_lm_name == "gemma-7b":
+                pretrained_path = "/home/ritik.r/7b"
+                logger.info(f"Auto-detected Gemma 7B checkpoint: {pretrained_path}")
+            else:  # gemma-2b or default
+                pretrained_path = "/home/ritik.r/2b"
+                logger.info(f"Auto-detected Gemma 2B checkpoint: {pretrained_path}")
+
         freeze = args.freeze_pretrained or config.model.freeze_lm
         model, gemma_params = create_gemma_model(
-            config, clustering_info, args.pretrained_path, freeze
+            config, clustering_info, pretrained_path, freeze
         )
     else:
         logger.info("Training from scratch (SimpleEfficientIDSModel)")
@@ -444,7 +483,7 @@ if __name__ == "__main__":
         '--config',
         type=str,
         default='qwen',
-        choices=['qwen', 'llama', 'debug', 'gemma', 'gemma_scratch', 'tpu_optimized'],
+        choices=['qwen', 'llama', 'debug', 'gemma', 'gemma_2b', 'gemma_2b_scratch', 'gemma_7b', 'gemma_7b_scratch'],
         help='Preset configuration to use'
     )
 
@@ -459,8 +498,8 @@ if __name__ == "__main__":
     parser.add_argument(
         '--pretrained_path',
         type=str,
-        default='/repo/uber/ai/michelangelo/sdk/inference/triton_and_llm_inference/2b',
-        help='Path to pretrained model checkpoint'
+        default='auto',
+        help='Path to pretrained model checkpoint (default: auto = /home/ritik.r/2b for Gemma 2B, /home/ritik.r/7b for Gemma 7B)'
     )
     parser.add_argument(
         '--freeze_pretrained',

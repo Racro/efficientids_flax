@@ -67,6 +67,7 @@ class ModelConfig:
         self.pretrained_model = None  # e.g., "google/gemma-2b"
         self.num_items = None  # For EfficientIDS
         self.num_clusters = None
+        self.item_embedding_dim = None
 
     def is_valid(self) -> bool:
         """Check if we have minimum required config."""
@@ -265,8 +266,8 @@ class ProfileAnalyzer:
                 with open(config_py) as f:
                     content = f.read()
 
-                # Try to find get_tpu_optimized_config function (most likely for TPU profiling)
-                tpu_func_start = content.find('def get_tpu_optimized_config')
+                # Try to find get_gemma_2b_config function (frozen pretrained Gemma 2B)
+                tpu_func_start = content.find('def get_gemma_2b_config')
                 if tpu_func_start != -1:
                     # First get function signature to extract default value for pretrained_lm_name
                     func_sig_end = content.find(') ->', tpu_func_start)

@@ -20,11 +20,11 @@
 # Core dependencies - strictly pinned for compatibility
 # NOTE: Install JAX separately first (see above for GPU/TPU specific commands)
 # jax[cuda12]==0.4.30  # Install separately - see instructions above
-flax==0.8.5
+flax==0.10.7
 optax==0.2.3
 
 # Checkpointing - compatible with JAX 0.4.30
-orbax-checkpoint==0.5.23
+orbax-checkpoint==0.11.8
 
 # Model loading (for pretrained LMs) - optional, comment out if not needed
 # transformers==4.44.0

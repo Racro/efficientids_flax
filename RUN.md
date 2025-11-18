@@ -12,14 +12,19 @@ Verifies setup works. 200 steps, completes quickly.
 
 ## 2. Full Training (TPU/GPU)
 
+### Gemma 2B (Frozen)
 ```bash
-python train_efficientids.py \
-  --config tpu_optimized \
-  --pretrained_path /home/ritik.r/2b
+python train_efficientids.py --config gemma_2b
 ```
 
-- Loads pretrained Gemma 2B
-- Freezes transformer (trains only adapters)
+### Gemma 7B (Frozen)
+```bash
+python train_efficientids.py --config gemma_7b
+```
+
+- Auto-detects checkpoint path (2B: `/home/ritik.r/2b`, 7B: `/home/ritik.r/7b`)
+- Loads pretrained weights and freezes transformer
+- Trains only adapters + item embeddings
 - Auto-shards across available devices (TPU/GPU)
 - 10K steps, saves checkpoints every 1000
 
@@ -28,17 +33,18 @@ python train_efficientids.py \
 ## 3. With Profiling
 
 ```bash
-python train_efficientids.py \
-  --config tpu_optimized \
-  --pretrained_path /home/ritik.r/2b \
-  --enable_profiling
+# Gemma 2B with profiling
+python train_efficientids.py --config gemma_2b --enable_profiling
+
+# Gemma 7B with profiling
+python train_efficientids.py --config gemma_7b --enable_profiling
 ```
 
-Same as #2, plus profiles steps 150-155.
+Same as #2, plus profiles steps 150-155 (after warmup).
 
 **View traces:**
 1. Go to https://ui.perfetto.dev/
-2. Drag & drop trace file from `checkpoints/tpu_gemma/profiler_traces/`
+2. Drag & drop trace file from `checkpoints/gemma_2b_frozen/profiler_traces/` (or `gemma_7b_frozen/`)
 3. Interactive timeline shows device ops, memory, communication
 
 ---

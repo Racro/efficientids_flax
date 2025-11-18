@@ -359,6 +359,13 @@ class GemmaEfficientIDSModel(nn.Module):
     clustering_info: Optional[Any] = None
     freeze_gemma: bool = True
 
+    # Gemma architecture parameters (configurable for different model sizes)
+    num_layers: int = 18  # Gemma 2B: 18, Gemma 7B: 28
+    num_heads: int = 8  # Gemma 2B: 8, Gemma 7B: 16
+    num_kv_heads: int = 1  # Gemma 2B: 1 (GQA), Gemma 7B: 16 (MHA)
+    head_dim: int = 256  # Both use 256
+    intermediate_dim: int = 16384  # Gemma 2B: 16384, Gemma 7B: 24576
+
     @nn.compact
     def __call__(
         self,
@@ -410,14 +417,14 @@ class GemmaEfficientIDSModel(nn.Module):
         # Project to model space
         model_space_embs = item_input_adapter(raw_item_embs)  # [batch, seq_len, 2048]
 
-        # Gemma transformer
+        # Gemma transformer (use configured parameters for model size)
         gemma_transformer = GemmaTransformer(
-            num_layers=18,
-            num_heads=8,
-            num_kv_heads=1,
-            head_dim=256,
-            hidden_dim=2048,
-            intermediate_dim=16384,
+            num_layers=self.num_layers,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            hidden_dim=self.model_dims,
+            intermediate_dim=self.intermediate_dim,
             name='transformer'
         )
 

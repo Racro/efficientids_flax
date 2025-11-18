@@ -212,8 +212,17 @@ class Trainer:
                 if 'transformer/' in path_str:
                     # Large weight matrices (kernels, embeddings)
                     if ('kernel' in path_str or 'embedding' in path_str) and len(shape) >= 2:
-                        # Shard first dimension across model axis
-                        return P('model', None)
+                        # Check if first dimension is divisible by number of devices
+                        if shape[0] % num_devices == 0:
+                            # Shard first dimension across model axis
+                            return P('model', None)
+                        elif len(shape) >= 2 and shape[1] % num_devices == 0:
+                            # If first dim not divisible, try sharding along second dimension
+                            # (e.g., for combined QKV weights with shape (3, num_heads, ...))
+                            return P(None, 'model')
+                        else:
+                            # Can't shard efficiently, replicate instead
+                            return P(None)
                     else:
                         # Small params (bias, scale) - replicate
                         return P(None)
